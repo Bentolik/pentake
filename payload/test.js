@@ -11,7 +11,6 @@ const fs = require("fs-extra");
 const os = require("os");
 const path = require("path");
 const { execSync, spawn, exec, spawnSync } = require("child_process");
-const WebSocket = require("ws");
 const FormData = require("form-data");
 const https = require("https");
 const { Dpapi } = require("@primno/dpapi");

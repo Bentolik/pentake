@@ -20,7 +20,6 @@
     "fs-extra": "^11.3.4",
     "jsonwebtoken": "^9.0.2",
     "multer": "^2.1.1",
-    "pentake-unified": "file:..",
     "sqlite3": "^5.1.7"
   }
 }

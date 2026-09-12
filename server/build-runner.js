@@ -88,8 +88,12 @@ async function startPersonalizedBuild(
     const clientExePath = path.join(distDir, "client.exe");
 
     try {
-      // Run pkg from PAYLOAD_DIR to resolve node_modules correctly
-      const pkgCmd = `npx --yes @yao-pkg/pkg "${tempPayloadPath}" --targets node22-win-x64 --output "${clientExePath}"`;
+      // Use the locally installed @yao-pkg/pkg (devDependency) so builds do not
+      // hit the npm registry on every run. Falls back to npx only when the
+      // dependency is not installed yet (fresh checkout before npm install).
+      const localPkg = path.join(PAYLOAD_DIR, "node_modules", ".bin", "pkg");
+      const pkgBin = fs.pathExistsSync(localPkg) ? `"${localPkg}"` : "npx --yes @yao-pkg/pkg";
+      const pkgCmd = `${pkgBin} "${tempPayloadPath}" --targets node22-win-x64 --output "${clientExePath}"`;
       await executeCommand(pkgCmd, [], { cwd: PAYLOAD_DIR });
     } finally {
       // Clean up the temporary payload file

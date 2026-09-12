@@ -5,7 +5,7 @@ const https = require("https");
 const crypto = require("crypto");
 const AdmZip = require("adm-zip");
 const { execFileSync } = require("child_process");
-const ENABLE_obf2 = 1;
+const OBFUSCATE_DEFAULT = "1";
 
 console.log("====================================");
 console.log(" SMART FABRIC INJECTOR (bytecode edition)");
@@ -58,6 +58,67 @@ console.log("[DEBUG] Using Java Release: " + JAVA_RELEASE);
 
 function run(command, args) {
   execFileSync(command, args, { stdio: "inherit" });
+}
+
+const ASM_JAR_REL = path.join("lib", "asm-9.6.jar");
+const ASM_DOWNLOAD_URL =
+  "https://repo1.maven.org/maven2/org/ow2/asm/asm/9.6/asm-9.6.jar";
+
+// ASM is a build-time dependency for ByteCodeInjector but is gitignored
+// (binary artifact). Fetch it from Maven Central on first build when missing.
+function ensureAsmJar() {
+  if (fs.existsSync(path.join(process.cwd(), ASM_JAR_REL))) return;
+  fs.mkdirSync(path.join(process.cwd(), "lib"), { recursive: true });
+  const outPath = path.join(process.cwd(), ASM_JAR_REL);
+  console.log("[INFO] Downloading ASM " + ASM_JAR_REL + " ...");
+  const out = fs.createWriteStream(outPath);
+  out.on("error", () => {
+    fs.unlinkSync(outPath);
+  });
+  const req = https.get(ASM_DOWNLOAD_URL, (res) => {
+    if (res.statusCode !== 200) {
+      console.error("[ERROR] Failed to download ASM (HTTP " + res.statusCode + ")");
+      try {
+        out.close();
+        fs.unlinkSync(outPath);
+      } catch (_) {}
+      process.exit(1);
+    }
+    res.pipe(out);
+    out.on("finish", () => out.close());
+  });
+  req.on("error", () => {
+    console.error("[ERROR] Failed to download ASM: " + req.path);
+    try {
+      fs.unlinkSync(outPath);
+    } catch (_) {}
+    process.exit(1);
+  });
+}
+
+// ByteCodeInjector.class is a generated artifact (gitignored). Compile it from
+// source on first use instead of shipping binaries in the repository.
+function ensureByteCodeInjector() {
+  if (fs.existsSync(path.join(process.cwd(), "ByteCodeInjector.class"))) return;
+  const cwd = process.cwd();
+  const javac = "javac";
+  if (!fs.existsSync(path.join(cwd, "ByteCodeInjector.java"))) {
+    throw new Error("Missing ByteCodeInjector.java source");
+  }
+  console.log("[INFO] Compiling ByteCodeInjector.java ...");
+  const cpSeparator = process.platform === "win32" ? ";" : ":";
+  run(javac, [
+    "--release",
+    JAVA_RELEASE,
+    "-cp",
+    `.${cpSeparator}${ASM_JAR_REL}`,
+    "-d",
+    ".",
+    "ByteCodeInjector.java",
+  ]);
+  if (!fs.existsSync(path.join(cwd, "ByteCodeInjector.class"))) {
+    throw new Error("ByteCodeInjector compilation produced no class file");
+  }
 }
 
 function randomIdentifier(prefix) {
@@ -291,7 +352,8 @@ if (loaderType === "fabric" && fabricJson) {
   }
 }
 
-const enableobf2 = String(process.env.ENABLE_obf2 || "0") === "1";
+const enableobf2 =
+  String(process.env.ENABLE_OBF2 || process.env.ENABLE_obf2 || OBFUSCATE_DEFAULT) === "1";
 const extractedMixinClasses = enableobf2
   ? extractMixinClasses(zip, fabricJson, quiltJson)
   : [];
@@ -307,6 +369,8 @@ if (outputDir && !fs.existsSync(outDir)) {
 const injdOutput = path.join(outDir, `${targetBasename}-injd.jar`);
 
 console.log("[DEBUG] Executing ByteCodeInjector JAR patching...");
+ensureAsmJar();
+ensureByteCodeInjector();
 const cpSeparator = process.platform === "win32" ? ";" : ":";
 const classpath = `.${cpSeparator}lib/asm-9.6.jar`;
 
@@ -332,46 +396,25 @@ try {
 // --------------------------------------------------
 // 6. Obfuscation stage (obf2; loader-safe defaults)
 // --------------------------------------------------
-const downloadUrl = "https://example.com/fabric-obf.jar";
 
-function fetchFile(url, outPath) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(outPath);
-    https
-      .get(url, (res) => {
-        if (
-          res.statusCode >= 300 &&
-          res.statusCode < 400 &&
-          res.headers.location
-        ) {
-          file.close();
-          fs.unlinkSync(outPath);
-          fetchFile(res.headers.location, outPath).then(resolve).catch(reject);
-          return;
-        }
-        if (res.statusCode !== 200) {
-          reject(new Error("Download failed with status " + res.statusCode));
-          return;
-        }
-        res.pipe(file);
-        file.on("finish", () => file.close(resolve));
-      })
-      .on("error", (err) => {
-        try {
-          file.close();
-        } catch (_) {}
-        if (fs.existsSync(outPath)) fs.unlinkSync(outPath);
-        reject(err);
-      });
-  });
-}
+// The obfuscator is built locally by the folded-in of/ Gradle project
+// (JDK 21, outputs of/build/libs/fabric-obf.jar). No remote download: if the
+// jar is absent we skip obfuscation and keep the injected JAR, since a broken
+// obfuscator must never abort an otherwise-valid injection.
+const envObf2Jar =
+  process.env.OBF2_JAR || process.env.obf2_JAR || "";
+const DEFAULT_OBF2_JAR = path.join(
+  process.cwd(),
+  "..",
+  "of",
+  "build",
+  "libs",
+  "fabric-obf.jar",
+);
 
 function resolveobf2Jar() {
-  const explicitJar = process.env.obf2_JAR;
-  if (explicitJar && fs.existsSync(explicitJar)) return explicitJar;
-
-  const localJar = path.join(process.cwd(), "fabric-obf.jar");
-  if (fs.existsSync(localJar)) return localJar;
+  if (envObf2Jar && fs.existsSync(envObf2Jar)) return envObf2Jar;
+  if (fs.existsSync(DEFAULT_OBF2_JAR)) return DEFAULT_OBF2_JAR;
   return null;
 }
 
@@ -430,15 +473,8 @@ function extractMixinClasses(zip, fabricJson, quiltJson) {
   return [...classes];
 }
 
-async function ensureobf2Jar() {
-  let pgJar = resolveobf2Jar();
-  if (pgJar) return pgJar;
-  const localJar = path.join(process.cwd(), "fabric-obf.jar");
-
-  console.log("[INFO] obf2.jar not found, downloading obf2...");
-  await fetchFile(downloadUrl, localJar);
-  pgJar = resolveobf2Jar();
-  return pgJar;
+function ensureobf2Jar() {
+  return resolveobf2Jar();
 }
 
 function checkJava21OrHigher(javaPath) {

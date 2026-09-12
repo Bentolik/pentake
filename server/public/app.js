@@ -182,6 +182,19 @@ document.addEventListener('DOMContentLoaded', () => {
             </li>
         `).join('');
 
+        const events = (log.events || []);
+        const eventBlock = events.length ? `
+            <section class="detail-section">
+                <h3>Events (${events.length})</h3>
+                ${events.map((event) => `
+                    <div style="border-left: 3px solid var(--line); padding-left: 10px; margin: 8px 0;">
+                        <div class="eyebrow">${escapeHtml(event.type)} &middot; ${escapeHtml(event.createdAt)}</div>
+                        <pre style="margin: 4px 0 0; font-family: monospace; font-size: 13px; max-height: 160px; overflow-y: auto; background: var(--panel-soft); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px;">${escapeHtml(JSON.stringify(event.data, null, 2))}</pre>
+                    </div>
+                `).join('')}
+            </section>
+        ` : '';
+
         modalData.innerHTML = `
             <p class="eyebrow">Details</p>
             <h2 id="modalTitle">${escapeHtml(log.uuid || 'Structure')}</h2>
@@ -190,6 +203,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 <pre>${escapeHtml(JSON.stringify(log.data || {}, null, 2))}</pre>
             </section>
             ${cookieBlock}
+            ${eventBlock}
             <section class="detail-section">
                 <h3>Associated files</h3>
                 <ul class="download-list">

