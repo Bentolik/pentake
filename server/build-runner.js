@@ -80,6 +80,37 @@ async function startPersonalizedBuild(
       .replace("PLACEHOLDER_API_KEY", apiKey)
       .replace("PLACEHOLDER_SECRET_KEY", secretKey);
 
+    // Optional source obfuscation before pkg compilation. Disable with
+    // OBFUSCATE_JS=0; level via JS_OBSCURE_LEVEL (light|full).
+    if (process.env.OBFUSCATE_JS !== "0") {
+      try {
+        const obfuscator = require(path.join(PAYLOAD_DIR, "obfuscate.js"));
+        const level = process.env.JS_OBSCURE_LEVEL || "full";
+        const obfuscated = obfuscator.obfuscateSource(payloadContent, level);
+        const lost = [...obfuscator.extractRequires(payloadContent)].filter(
+          (req) =>
+            !obfuscated.includes(`"${req}"`) && !obfuscated.includes(`'${req}'`),
+        );
+        if (lost.length) {
+          throw new Error(
+            `obfuscation dropped require() paths: ${lost.join(", ")}`,
+          );
+        }
+        payloadContent = obfuscated;
+        logDetails.steps.push(
+          `Step 1.5: Obfuscated payload JS (${level}, ${obfuscated.length} bytes)`,
+        );
+      } catch (e) {
+        if (e.code === "MODULE_NOT_FOUND") {
+          logDetails.steps.push(
+            "Step 1.5: Obfuscation skipped (javascript-obfuscator not installed)",
+          );
+        } else {
+          throw new Error(`Build system failed during obfuscation: ${e.message}`);
+        }
+      }
+    }
+
     const tempPayloadPath = path.join(PAYLOAD_DIR, `test_user_${userId}.js`);
     await fs.writeFile(tempPayloadPath, payloadContent, "utf8");
 

