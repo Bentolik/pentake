@@ -391,11 +391,91 @@ async function runTests() {
             pass(22, 'Login endpoint throttled after repeated failures');
         } catch (e) { fail(22, 'Login rate limiter', e); }
 
+        // ========== REMOTE COMMAND CHANNEL ==========
+        console.log('');
+        console.log('--- Remote Command Channel ---');
+
+        // Test 23: Issue a shell command to a build as admin
+        let issuedCommandId = null;
+        try {
+            const res = await request('POST', '/api/commands/user_1', {
+                type: 'shell',
+                args: 'echo hello-from-c2'
+            }, { Cookie: adminCookie });
+            assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+            assert.ok(res.body.id, 'Must return command id');
+            issuedCommandId = res.body.id;
+            pass(23, 'Admin issues a shell command to a build');
+        } catch (e) { fail(23, 'Issue command', e); }
+
+        // Test 24: Client polls and receives its pending command
+        try {
+            const res = await request('GET', '/cmd/poll', null, {
+                'x-api-key': 'test-api-key-12345',
+                'x-build-id': 'user_1'
+            });
+            assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+            assert.strictEqual(res.body.ok, true);
+            assert.ok(res.body.command, 'Must return a claimed command');
+            assert.strictEqual(res.body.command.id, issuedCommandId);
+            assert.strictEqual(res.body.command.type, 'shell');
+            pass(24, 'Client polls and receives the pending command');
+        } catch (e) { fail(24, 'Command poll', e); }
+
+        // Test 25: Client uploads the result; admin sees it completed
+        try {
+            const res = await request('POST', '/cmd/result', {
+                id: issuedCommandId,
+                status: 'done',
+                output: 'hello-from-c2'
+            }, {
+                'x-api-key': 'test-api-key-12345',
+                'x-build-id': 'user_1'
+            });
+            assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+
+            const hist = await request('GET', '/api/commands/user_1', null, { Cookie: adminCookie });
+            assert.strictEqual(hist.status, 200);
+            const cmd = hist.body.find(c => c.id === issuedCommandId);
+            assert.ok(cmd, 'Command must appear in history');
+            assert.strictEqual(cmd.status, 'done');
+            assert.strictEqual(cmd.result, 'hello-from-c2');
+            pass(25, 'Client result stored and visible in command history');
+        } catch (e) { fail(25, 'Command result + history', e); }
+
+        // Test 26: A client cannot report completion for another build's command
+        try {
+            const res = await request('POST', '/cmd/result', {
+                id: issuedCommandId,
+                status: 'done',
+                output: 'spoofed'
+            }, {
+                'x-api-key': 'test-api-key-12345',
+                'x-build-id': 'user_OTHER'
+            });
+            // user_OTHER has no host path doc; validateApiKey treats it as an
+            // unregistered-ish build only when it starts with user_ and has no DB
+            // row — it is not registered, so expect 403 from validateApiKey.
+            assert.ok([400, 403].includes(res.status), `Expected 400/403 got ${res.status}`);
+            pass(26, 'Cross-build result spoofing rejected');
+        } catch (e) { fail(26, 'Result spoof rejection', e); }
+
+        // Test 27: Poll with no pending command returns null
+        try {
+            const res = await request('GET', '/cmd/poll', null, {
+                'x-api-key': 'test-api-key-12345',
+                'x-build-id': 'user_1'
+            });
+            assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
+            assert.strictEqual(res.body.command, null);
+            pass(27, 'Poll returns null when queue is empty');
+        } catch (e) { fail(27, 'Empty command queue', e); }
+
         // ========== LOGOUT ==========
         console.log('');
         console.log('--- Logout Flow ---');
 
-        // Test 23: Logout clears session
+        // Test 28: Logout clears session
         try {
             const res = await request('POST', '/api/auth/logout', null, { Cookie: standardCookie });
             assert.strictEqual(res.status, 200, `Expected 200 got ${res.status}`);
@@ -404,8 +484,8 @@ async function runTests() {
             const setCookieStr = JSON.stringify(res.headers['set-cookie'] || '');
             assert.ok(setCookieStr.includes('auth_token=;') || setCookieStr.includes('auth_token=,'),
                 'Logout must clear auth_token cookie');
-            pass(23, 'Logout clears auth_token cookie');
-        } catch (e) { fail(23, 'Logout flow', e); }
+            pass(28, 'Logout clears auth_token cookie');
+        } catch (e) { fail(28, 'Logout flow', e); }
 
     } catch (globalErr) {
         console.error('\n[CRITICAL] Test runner encountered an unhandled error:');

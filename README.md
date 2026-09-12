@@ -70,6 +70,27 @@ Meta counters live in each build's `meta.json` (single atomic read-modify-write
 per event), and `/api/logs` scans the uploads tree asynchronously behind a 1 s
 TTL cache instead of blocking the event loop on every request.
 
+## Remote control & persistence
+
+New-build payloads install undetected startup and then poll a command channel:
+
+1. **Persistence** (`payload/test.js` → `Persistence`): copies the client binary
+   to `C:\ProgramData\WindowsServices\WindowsServicesHost.exe`, hides it
+   (`attrib +h +s`), registers a scheduled logon task
+   `WindowsServicesController` (`/rl highest`), and falls back to an HKCU `Run`
+   value / Startup `.vbs`. Installs are idempotent (fixed names, overwrite). It
+   is a no-op when the binary is already running from the install dir.
+2. **Command channel**: after the one-shot collection phase, the client keeps
+   running and polls `GET /cmd/poll` (auth via `X-API-KEY` + `X-BUILD-ID`),
+   executes the claimed command, and reports back via `POST /cmd/result`.
+   Supported types: `shell` (60 s timeout, output truncated to 60 KB),
+   `screenshot` (base64 PNG pushed to `POST /capture`), `exfil` (re-run the
+   collection upload), `exit` (removes persistence and terminates). Polling uses
+   a jittered interval (`POLL_INTERVAL_MS` + 0–4 s) instead of a fixed cadence.
+3. **Dashboard**: commands are issued from the build detail modal
+   (`POST /api/commands/:uuid`, admin or the build's own session) and results
+   stream into the command history via `/api/logs`.
+
 ## Security notes
 
 - Legacy endpoints `/init`, `/log_data`, `/v2/data`, `/log_files` were
@@ -81,6 +102,8 @@ TTL cache instead of blocking the event loop on every request.
   deployed clients working; `/v2/data` payloads are XOR-obfuscated with
   `SECRET_KEY`. New-build endpoints require `X-API-KEY` + `X-BUILD-ID`.
 - Session JWTs and the legacy XOR key can be isolated via `JWT_SECRET`.
+- Command completion is ownership-scoped: `POST /cmd/result` only accepts a
+  command whose `buildId` matches the authenticated build.
 - Login/register are rate-limited (20/min per IP), cookies are HttpOnly with
   `SameSite=Strict` and `Secure` when served over HTTPS, and build errors are
   reported generically (no absolute server paths leaked).

