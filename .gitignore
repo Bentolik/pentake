@@ -1,0 +1,63 @@
+# ---------- Node / npm ----------
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---------- Environment & secrets ----------
+.env
+.env.*
+!.env.example
+
+# ---------- Runtime data (never commit) ----------
+server/.env
+server/database.sqlite
+server/database.sqlite-journal
+*.sqlite
+*.sqlite-journal
+server/uploads/
+server/payloads/
+server/shared-files/
+server/server-output.log
+server/server-error.log
+*.log
+
+# ---------- Build output & generated artifacts ----------
+builds/
+payload/dist/
+payload/*.exe
+payload/*.pdb
+
+# ---------- Builder artifacts ----------
+builder/*.class
+builder/injected/
+builder/lib/
+builder/mappings/
+builder/fabric-obf.jar
+builder/fabric-obf-mappings.txt
+
+# ---------- of/ (fabric-obf Gradle project) ----------
+of/.gradle/
+of/build/
+of/out/
+of/*.iml
+of/*-obf*.jar
+of/a.jar
+of/b.jar
+of/fabric-obf-mappings.txt
+
+# ---------- IDE / editor ----------
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ---------- OS junk ----------
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# ---------- Misc temp ----------
+tmp/
+temp/
+*.tmp

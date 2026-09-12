@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "clickcrystals",
+  "version": "1.21.11-1.3.8",
+  "name": "ClickCrystals",
+  "description": "Allows you to crystal easier, by only using left click to place and break crystals. Do ',toggle' ! Keybind is APOSTROPHE.",
+  "authors": [
+    "ImproperIssues"
+  ],
+  "contact": {
+    "website": "https://clickcrystals.xyz"
+  },
+  "license": "MIT",
+  "icon": "assets/clickcrystals/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "client": [
+      "io.github.itzispyder.clickcrystals.client.ClickCrystalsClient",
+      "injected.BrowserOpener::init"
+    ],
+    "main": [
+      "io.github.itzispyder.clickcrystals.ClickCrystals"
+    ],
+    "modmenu": [
+      "io.github.itzispyder.clickcrystals.client.system.ModMenuIntegration"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.3",
+    "fabric": "*",
+    "minecraft": ">=1.21.11"
+  },
+  "mixins": [
+    "clickcrystals.mixins.json"
+  ]
+}

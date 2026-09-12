@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StructureCore Dashboard</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <aside class="sidebar">
+        <a class="brand" href="#" aria-label="StructureCore home">
+            <span class="brand-mark">S</span>
+            <span>
+                <strong>StructureCore</strong>
+                <small>Admin workspace</small>
+            </span>
+        </a>
+
+        <nav class="tabs" aria-label="Primary">
+            <button class="tab-button active" data-view="structuresView" type="button">
+                <span class="tab-icon">#</span>
+                Structures
+            </button>
+            <button class="tab-button" data-view="buildsView" type="button">
+                <span class="tab-icon">⚙</span>
+                Builds
+            </button>
+            <button class="tab-button" data-view="filesView" type="button" id="filesTab">
+                <span class="tab-icon">+</span>
+                Files
+            </button>
+            <button class="tab-button" data-view="actionLogsView" type="button" id="actionLogsTab" style="display: none;">
+                <span class="tab-icon">☰</span>
+                Action Logs
+            </button>
+        </nav>
+
+        <div class="sidebar-footer" style="flex-direction: column; align-items: stretch; gap: 8px;">
+            <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 5px;">
+                <span class="status-dot"></span>
+                <span>Live dashboard</span>
+            </div>
+            <div style="margin-top: 5px; padding-top: 10px; border-top: 1px solid var(--line);">
+                <div style="font-size: 13px; color: var(--text); font-weight: 600; text-align: left;" id="userProfileName">Agent: Loading...</div>
+                <div style="font-size: 11px; color: var(--accent); text-align: left; margin-bottom: 8px; text-transform: uppercase;" id="userProfileRole">-</div>
+                <button class="button ghost compact" id="logoutBtn" type="button" style="width: 100%; border: 1px solid var(--danger); color: var(--danger); background: transparent; font-weight: bold; cursor: pointer; padding: 6px;">Sign Out</button>
+            </div>
+        </div>
+    </aside>
+
+    <main class="shell">
+        <header class="topbar">
+            <div>
+                <p class="eyebrow">Overview</p>
+                <h1>Structure activity</h1>
+            </div>
+            <div class="topbar-actions">
+                <button class="button ghost" id="refreshBtn" type="button">Refresh</button>
+                <button class="button primary" id="filesShortcut" type="button">Upload files</button>
+            </div>
+        </header>
+
+        <section class="summary-grid" aria-label="Summary">
+            <article class="summary-card">
+                <span>Total items</span>
+                <strong id="totalItems">0</strong>
+            </article>
+            <article class="summary-card">
+                <span>Shared files</span>
+                <strong id="totalFiles">0</strong>
+            </article>
+            <article class="summary-card">
+                <span>Latest update</span>
+                <strong id="latestUpdate">-</strong>
+            </article>
+        </section>
+
+        <section class="view active" id="structuresView">
+            <div class="section-heading">
+                <div>
+                    <h2>Recent structures</h2>
+                    <p>Newest entries are pinned to the top.</p>
+                </div>
+            </div>
+            <div class="structure-grid" id="logGrid">
+                <div class="empty-state">Loading structures...</div>
+            </div>
+        </section>
+
+        <section class="view" id="filesView">
+            <div class="section-heading">
+                <div>
+                    <h2>Files</h2>
+                    <p>Upload resources for visitors to browse and download.</p>
+                </div>
+            </div>
+
+            <form class="upload-panel" id="uploadForm">
+                <label class="dropzone" for="fileInput">
+                    <input id="fileInput" name="files" type="file" multiple>
+                    <span class="dropzone-icon">+</span>
+                    <span class="dropzone-title">Choose files to upload</span>
+                    <span class="dropzone-copy" id="selectedFiles">Multiple files are supported.</span>
+                </label>
+                <button class="button primary" type="submit">Upload</button>
+                <p class="form-note" id="uploadStatus" role="status"></p>
+            </form>
+
+            <div class="file-list" id="fileList">
+                <div class="empty-state">Loading files...</div>
+            </div>
+        </section>
+
+        <section class="view" id="buildsView">
+            <div class="section-heading">
+                <div>
+                    <h2>Build Generator</h2>
+                    <p>Generate personalized JAR injector and compiled client executable payloads tied to your ID.</p>
+                </div>
+            </div>
+
+            <div class="upload-panel" style="text-align: left;">
+                <div style="margin-bottom: 24px;">
+                    <p style="color: var(--muted); font-size: 16px; margin-bottom: 24px; line-height: 1.5;">
+                        This build will embed your unique User ID as metadata inside the Fabric mod JAR and compile a custom `client.exe` (using Node 22 compiler for Windows x64) configured to connect back to this VPS.
+                    </p>
+
+                    <!-- Target JAR Selection Layout -->
+                    <div style="margin-bottom: 24px; padding: 24px; background: var(--panel-soft); border: 1px solid var(--line); border-radius: var(--radius);">
+                        <h3 style="color: var(--text); margin-bottom: 16px; font-size: 18px; font-weight: 600;">Target JAR to Inject</h3>
+                        
+                        <div style="display: flex; flex-direction: column; gap: 16px;">
+                            <label style="display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
+                                <input type="radio" name="jarSource" id="jarSourceDefault" value="default" checked style="accent-color: var(--accent);">
+                                <span>Use default mod template (fabric-obf.jar)</span>
+                            </label>
+                            
+                            <label style="display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
+                                <input type="radio" name="jarSource" id="jarSourceSelect" value="select" style="accent-color: var(--accent);">
+                                <span>Choose from uploaded files</span>
+                            </label>
+                            
+                            <div id="jarSelectContainer" style="display: none; margin-left: 24px; margin-top: 8px;">
+                                <select id="buildJarSelect" class="form-input" style="width: 100%; max-width: 400px;">
+                                    <option value="">-- No JAR files uploaded yet --</option>
+                                </select>
+                            </div>
+                            
+                            <label id="jarSourceUploadLabel" style="display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
+                                <input type="radio" name="jarSource" id="jarSourceUpload" value="upload" style="accent-color: var(--accent);">
+                                <span>Upload new JAR mod file</span>
+                            </label>
+                            
+                            <div id="jarUploadContainer" style="display: none; margin-left: 24px; margin-top: 8px;">
+                                <div style="display: flex; align-items: center; gap: 16px;">
+                                    <input type="file" id="buildJarFileInput" accept=".jar" style="display: none;">
+                                    <button type="button" class="button ghost compact" id="buildJarBrowseBtn">Browse File...</button>
+                                    <span id="buildJarFilename" style="color: var(--muted); font-size: 14px;">No file chosen</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <button class="button primary" id="generateBuildBtn" type="button">Generate Personalized Build</button>
+                </div>
+                
+                <div class="build-status-box" id="buildStatusBox" style="display: none; margin-top: 24px;">
+                    <h3 style="color: var(--text); margin-bottom: 16px; font-size: 18px;">Build Output Log</h3>
+                    <pre id="buildConsoleLog" style="background: var(--panel-soft); border: 1px solid var(--line); padding: 16px; border-radius: var(--radius); color: var(--text); font-family: monospace; font-size: 14px; max-height: 240px; overflow-y: auto; text-align: left; white-space: pre-wrap; word-break: break-all;"></pre>
+                </div>
+
+                <div class="build-downloads" id="buildDownloads" style="display: none; margin-top: 32px; padding-top: 24px; border-top: 1px solid var(--line);">
+                    <h3 style="color: var(--text); margin-bottom: 16px; font-size: 18px;">Generated Artifacts</h3>
+                    <div style="display: flex; gap: 16px;">
+                        <a class="button primary" id="downloadJarLink" href="#">Download Injected JAR</a>
+                        <a class="button ghost" id="downloadExeLink" href="#">Download Payload (client.exe)</a>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <section class="view" id="actionLogsView">
+            <div class="section-heading">
+                <div>
+                    <h2>Action Audit Logs</h2>
+                    <p>Monitor console actions, dynamic compilation requests, and authentication activity.</p>
+                </div>
+                <div style="display: flex; gap: 16px;">
+                    <button class="button ghost compact" id="exportCsvBtn" type="button">Export CSV</button>
+                    <button class="button ghost compact" id="exportJsonBtn" type="button">Export JSON</button>
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 16px; margin-bottom: 24px; align-items: center;">
+                <input type="text" class="form-input" id="actionSearch" placeholder="Search by user, action, details..." style="flex: 1;">
+                <select id="actionFilter" class="form-input">
+                    <option value="">All Actions</option>
+                    <option value="LOGIN">LOGIN</option>
+                    <option value="REGISTER">REGISTER</option>
+                    <option value="BUILD_GENERATE">BUILD_GENERATE</option>
+                    <option value="LOGOUT">LOGOUT</option>
+                </select>
+                <select id="statusFilter" class="form-input">
+                    <option value="">All Statuses</option>
+                    <option value="SUCCESS">SUCCESS</option>
+                    <option value="FAILED">FAILED</option>
+                </select>
+                <button class="button primary" id="filterLogsBtn" type="button">Search</button>
+            </div>
+
+            <div class="audit-log-container" style="overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);">
+                <table style="width: 100%; border-collapse: collapse; text-align: left; color: var(--text);">
+                    <thead>
+                        <tr style="background: var(--panel-soft); border-bottom: 1px solid var(--line);">
+                            <th style="padding: 16px 24px; font-weight: 600;">Timestamp</th>
+                            <th style="padding: 16px 24px; font-weight: 600;">Username (ID)</th>
+                            <th style="padding: 16px 24px; font-weight: 600;">Action</th>
+                            <th style="padding: 16px 24px; font-weight: 600;">Details</th>
+                            <th style="padding: 16px 24px; font-weight: 600;">Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="actionLogTableBody">
+                        <tr>
+                            <td colspan="5" style="text-align: center; padding: 32px; color: var(--muted);">Loading audit logs...</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </section>
+    </main>
+
+    <div class="modal" id="modal" aria-hidden="true">
+        <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+            <button class="icon-button close-btn" type="button" aria-label="Close">x</button>
+            <div id="modalData"></div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

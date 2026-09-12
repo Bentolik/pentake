@@ -1,0 +1,479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StructureCore — Register</title>
+    <meta name="description" content="Request console access to the StructureCore platform.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg:        #000000;
+            --panel:     #0A0A0A;
+            --border:    #262626;
+            --accent:    #3B82F6;
+            --accent-dk: #2563EB;
+            --text:      #FAFAFA;
+            --muted:     #A3A3A3;
+            --danger:    #EF4444;
+            --success:   #10B981;
+            --glow:      rgba(59, 130, 246, 0.2);
+            --radius:    8px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        html, body {
+            height: 100%;
+            font-family: 'Inter', system-ui, sans-serif;
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            overflow: hidden;
+            padding: 24px 0;
+        }
+
+        /* Animated particle background */
+        .bg-grid {
+            position: fixed;
+            inset: 0;
+            background-image:
+                linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+            background-size: 50px 50px;
+            animation: gridScroll 20s linear infinite;
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        @keyframes gridScroll {
+            from { transform: translate(0, 0); }
+            to   { transform: translate(50px, 50px); }
+        }
+
+        .bg-radial {
+            position: fixed;
+            inset: 0;
+            background: radial-gradient(ellipse 80% 60% at 50% 30%, rgba(59, 130, 246, 0.1) 0%, transparent 70%);
+            pointer-events: none;
+            z-index: 0;
+        }
+
+        /* Floating orbs */
+        .orb {
+            position: fixed;
+            border-radius: 50%;
+            filter: blur(80px);
+            opacity: 0.1;
+            pointer-events: none;
+            z-index: 0;
+            animation: orbFloat 12s ease-in-out infinite;
+        }
+        .orb-1 { width: 400px; height: 400px; top: -100px; right: -80px; background: #2563EB; animation-delay: 0s; }
+        .orb-2 { width: 300px; height: 300px; bottom: -80px; left: -60px; background: #60A5FA; animation-delay: -4s; }
+        .orb-3 { width: 200px; height: 200px; top: 60%; left: 60%; background: #3B82F6; animation-delay: -8s; }
+
+        @keyframes orbFloat {
+            0%, 100% { transform: translate(0, 0) scale(1); }
+            33%       { transform: translate(20px, -20px) scale(1.05); }
+            66%       { transform: translate(-15px, 15px) scale(0.95); }
+        }
+
+        /* Card */
+        .card {
+            position: relative;
+            z-index: 1;
+            width: min(400px, calc(100vw - 32px));
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 48px 40px;
+            box-shadow:
+                0 10px 15px -3px rgba(0, 0, 0, 0.5),
+                0 4px 6px -2px rgba(0, 0, 0, 0.3);
+            animation: cardIn 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        @keyframes cardIn {
+            from { opacity: 0; transform: translateY(28px) scale(0.97); }
+            to   { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        .card::before {
+            content: '';
+            position: absolute;
+            top: 0; left: 0; right: 0;
+            height: 1px;
+            background: linear-gradient(90deg, transparent, var(--accent), transparent);
+            opacity: 0.6;
+            animation: scanLine 3s ease-in-out infinite;
+        }
+
+        @keyframes scanLine {
+            0%, 100% { opacity: 0.4; }
+            50%       { opacity: 0.9; }
+        }
+
+        .logo-row {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            margin-bottom: 32px;
+        }
+
+        .logo-mark {
+            width: 48px;
+            height: 48px;
+            background: var(--accent);
+            border-radius: 12px;
+            display: grid;
+            place-items: center;
+            font-size: 22px;
+            font-weight: 900;
+            color: #FFFFFF;
+            box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);
+            flex-shrink: 0;
+        }
+
+        .logo-text { display: flex; flex-direction: column; }
+
+        .logo-name {
+            font-size: 18px;
+            font-weight: 800;
+            letter-spacing: -0.3px;
+            color: var(--text);
+        }
+
+        .logo-sub {
+            font-size: 12px;
+            color: var(--accent);
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+            margin-top: 2px;
+        }
+
+        .heading { margin-bottom: 28px; }
+
+        .heading h1 {
+            font-size: 26px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            line-height: 1.2;
+        }
+
+        .heading p {
+            margin-top: 6px;
+            font-size: 14px;
+            color: var(--muted);
+        }
+
+        .form-group { margin-bottom: 16px; }
+
+        .form-label {
+            display: block;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: var(--muted);
+            margin-bottom: 8px;
+        }
+
+        .form-input {
+            width: 100%;
+            background: #171717;
+            border: 1px solid var(--border);
+            color: var(--text);
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            font-size: 16px;
+            font-family: inherit;
+            transition: border-color 0.2s, box-shadow 0.2s, background 0.2s;
+            outline: none;
+        }
+
+        .form-input::placeholder { color: #A3A3A3; }
+
+        .form-input:focus {
+            border-color: var(--accent);
+            background: #0A0A0A;
+            box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2);
+        }
+
+        select.form-input {
+            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232563EB' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+            background-repeat: no-repeat;
+            background-position: right 12px center;
+            background-size: 16px;
+            padding-right: 36px;
+            cursor: pointer;
+        }
+
+        /* Admin code reveal with animation */
+        .admin-code-group {
+            overflow: hidden;
+            max-height: 0;
+            opacity: 0;
+            transition: max-height 0.35s ease, opacity 0.25s ease, margin-bottom 0.3s ease;
+            margin-bottom: 0;
+        }
+
+        .admin-code-group.visible {
+            max-height: 90px;
+            opacity: 1;
+            margin-bottom: 16px;
+        }
+
+        /* Role selector pills */
+        .role-pills {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+
+        .role-pill {
+            padding: 12px 16px;
+            background: #171717;
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            color: var(--muted);
+            font-size: 14px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            text-align: center;
+            transition: all 0.2s;
+        }
+
+        .role-pill:hover { border-color: var(--accent); color: var(--text); background: #262626; }
+
+        .role-pill.active {
+            background: #0A0A0A;
+            border-color: var(--accent);
+            color: var(--accent);
+            box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2);
+        }
+
+        .role-label {
+            display: block;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.6px;
+            color: var(--muted);
+            margin-bottom: 8px;
+        }
+
+        .btn-primary {
+            width: 100%;
+            margin-top: 16px;
+            padding: 12px 24px;
+            background: var(--accent);
+            color: #FFFFFF;
+            border: none;
+            border-radius: var(--radius);
+            font-size: 16px;
+            font-weight: 600;
+            font-family: inherit;
+            cursor: pointer;
+            transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
+            box-shadow: 0 4px 6px -1px rgba(37, 99, 235, 0.2);
+        }
+
+        .btn-primary:hover {
+            background: var(--accent-dk);
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(37, 99, 235, 0.3);
+        }
+        .btn-primary:active { transform: translateY(0); opacity: 0.9; }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
+
+        .status-msg {
+            margin-top: 16px;
+            padding: 12px 16px;
+            border-radius: var(--radius);
+            font-size: 14px;
+            font-weight: 600;
+            display: none;
+            animation: fadeIn 0.2s ease;
+        }
+
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+        .status-msg.error {
+            background: #450A0A;
+            border: 1px solid #7F1D1D;
+            color: #FCA5A5;
+        }
+
+        .status-msg.success {
+            background: #022C22;
+            border: 1px solid #065F46;
+            color: #34D399;
+        }
+
+        .card-footer {
+            margin-top: 32px;
+            padding-top: 24px;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            font-size: 14px;
+            color: var(--muted);
+        }
+
+        .card-footer a {
+            color: var(--accent);
+            font-weight: 600;
+            text-decoration: none;
+            transition: opacity 0.15s;
+        }
+
+        .card-footer a:hover { opacity: 0.75; }
+    </style>
+</head>
+<body>
+    <div class="bg-grid"></div>
+    <div class="bg-radial"></div>
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+
+    <div class="card">
+        <div class="logo-row">
+            <div class="logo-mark">S</div>
+            <div class="logo-text">
+                <span class="logo-name">StructureCore</span>
+                <span class="logo-sub">Access Request</span>
+            </div>
+        </div>
+
+        <div class="heading">
+            <h1>Create agent profile</h1>
+            <p>Register to access the operational console.</p>
+        </div>
+
+        <form id="registerForm" autocomplete="on">
+            <div class="form-group">
+                <label class="form-label" for="username">Username</label>
+                <input class="form-input" type="text" id="username" name="username"
+                       required autocomplete="username" placeholder="Choose a username">
+            </div>
+
+            <div class="form-group">
+                <label class="form-label" for="password">Password</label>
+                <input class="form-input" type="password" id="password" name="new-password"
+                       required autocomplete="new-password" placeholder="Create a strong password">
+            </div>
+
+            <div>
+                <span class="role-label">Access Level</span>
+                <div class="role-pills">
+                    <button type="button" class="role-pill active" data-role="standard" id="pillStandard">
+                        👤 Field Agent
+                    </button>
+                    <button type="button" class="role-pill" data-role="admin" id="pillAdmin">
+                        🛡 Administrator
+                    </button>
+                </div>
+                <input type="hidden" id="selectedRole" value="standard">
+            </div>
+
+            <div class="admin-code-group" id="adminCodeGroup">
+                <label class="form-label" for="adminCode">Admin Invite Code</label>
+                <input class="form-input" type="password" id="adminCode" name="adminCode"
+                       autocomplete="off" placeholder="Enter admin creation key">
+            </div>
+
+            <button class="btn-primary" type="submit" id="submitBtn">Create Profile</button>
+            <div class="status-msg error" id="errorMsg"></div>
+            <div class="status-msg success" id="successMsg">✓ Profile created! Redirecting to login...</div>
+        </form>
+
+        <div class="card-footer">
+            Already registered? <a href="login.html">Sign in →</a>
+        </div>
+    </div>
+
+    <script>
+        // Role pill toggle logic
+        const pills = document.querySelectorAll('.role-pill');
+        const selectedRole = document.getElementById('selectedRole');
+        const adminCodeGroup = document.getElementById('adminCodeGroup');
+        const adminCodeInput = document.getElementById('adminCode');
+
+        pills.forEach(pill => {
+            pill.addEventListener('click', () => {
+                pills.forEach(p => p.classList.remove('active'));
+                pill.classList.add('active');
+                const role = pill.dataset.role;
+                selectedRole.value = role;
+
+                if (role === 'admin') {
+                    adminCodeGroup.classList.add('visible');
+                    adminCodeInput.setAttribute('required', 'required');
+                } else {
+                    adminCodeGroup.classList.remove('visible');
+                    adminCodeInput.removeAttribute('required');
+                    adminCodeInput.value = '';
+                }
+            });
+        });
+
+        // Form submission
+        const form = document.getElementById('registerForm');
+        const submitBtn = document.getElementById('submitBtn');
+        const errorMsg = document.getElementById('errorMsg');
+        const successMsg = document.getElementById('successMsg');
+
+        form.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const username = document.getElementById('username').value.trim();
+            const password = document.getElementById('password').value;
+            const role = selectedRole.value;
+            const adminCode = adminCodeInput.value;
+
+            errorMsg.style.display = 'none';
+            successMsg.style.display = 'none';
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Creating profile...';
+
+            try {
+                const res = await fetch('/api/auth/register', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password, role, adminCode })
+                });
+
+                const data = await res.json();
+                if (res.ok) {
+                    successMsg.style.display = 'block';
+                    submitBtn.textContent = 'Profile Created ✓';
+                    setTimeout(() => { window.location.href = '/login.html'; }, 1600);
+                } else {
+                    errorMsg.textContent = data.error || 'Registration failed. Please try again.';
+                    errorMsg.style.display = 'block';
+                    submitBtn.disabled = false;
+                    submitBtn.textContent = 'Create Profile';
+                }
+            } catch (err) {
+                errorMsg.textContent = 'Server connection failed. Please try again.';
+                errorMsg.style.display = 'block';
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Create Profile';
+            }
+        });
+    </script>
+</body>
+</html>

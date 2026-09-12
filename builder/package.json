@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "obfuscate": "node index.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.17",
+    "tmp": "^0.2.5"
+  }
+}
