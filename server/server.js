@@ -28,6 +28,7 @@ const PORT = process.env.PORT || 3000;
 const UPLOADS_DIR = process.env.UPLOADS_DIR ? path.resolve(process.env.UPLOADS_DIR) : path.join(__dirname, 'uploads');
 const PAYLOADS_DIR = process.env.PAYLOADS_DIR ? path.resolve(process.env.PAYLOADS_DIR) : path.join(__dirname, 'payloads');
 const SHARED_FILES_DIR = process.env.SHARED_FILES_DIR ? path.resolve(process.env.SHARED_FILES_DIR) : path.join(__dirname, 'shared-files');
+const BUILDS_DIR = process.env.BUILDS_DIR ? path.resolve(process.env.BUILDS_DIR) : path.join(__dirname, '..', 'builds');
 const SHARED_FILES_TEMP_DIR = path.join(SHARED_FILES_DIR, 'temp');
 
 // Ensure directories exist
@@ -576,11 +577,11 @@ app.get('/api/payloads/download/:userId/:filename', (req, res) => {
     const safeUserId = userId.replace(/[^a-zA-Z0-9-_]/g, '');
     const safeFilename = filename.replace(/[^a-zA-Z0-9-_\.]/g, '');
     
-    if (safeFilename !== 'client.exe' && safeFilename !== `injected_mod_user_${safeUserId}.jar`) {
+    if (safeFilename !== 'client.exe' && safeFilename !== 'worker.exe' && safeFilename !== `injected_mod_user_${safeUserId}.jar`) {
         return res.status(400).send('Invalid file requested');
     }
 
-    const filePath = path.resolve(__dirname, '..', 'builds', `user_${safeUserId}`, 'dist', safeFilename);
+    const filePath = path.join(BUILDS_DIR, `user_${safeUserId}`, 'dist', safeFilename);
     
     if (fs.existsSync(filePath)) {
         res.download(filePath);
@@ -1261,7 +1262,7 @@ db.initDatabase()
       // configured cap. Interval/env knobs are handled inside the module.
       const cleanupIntervalMs = Number(process.env.CLEANUP_INTERVAL_MS) || 60 * 60 * 1000;
       const schedulerHandle = startCleanupScheduler(
-        () => configFromEnv({ uploadsDir: UPLOADS_DIR, sharedFilesDir: SHARED_FILES_DIR, buildsDir: path.resolve(__dirname, '..', 'builds') }),
+        () => configFromEnv({ uploadsDir: UPLOADS_DIR, sharedFilesDir: SHARED_FILES_DIR, buildsDir: BUILDS_DIR }),
         cleanupIntervalMs
       );
       if (schedulerHandle && schedulerHandle.unref) schedulerHandle.unref();

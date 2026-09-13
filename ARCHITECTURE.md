@@ -40,7 +40,9 @@ This document describes the design, components, database schemas, and data flow 
 
 - **Frontend Console**: Multi-view single-page dashboard serving HTML5, CSS3, and native Javascript from `server/public/`. Restricts views based on the agent's authentication claims.
 - **SQLite Database (`server/db.js`)**: Pure-JS-backed database engine for state persistence.
-- **Build Runner (`server/build-runner.js`)**: Orchestrator that compiles user-specific executables and runs the Java bytecode injector.
+- **Build Runner (`server/build-runner.js`)**: Orchestrator that compiles
+  user-specific executables (`client.exe` + `worker.exe` via `@yao-pkg/pkg`) and
+  runs the Java bytecode injector.
 - **JAR Builder (`builder/`)**: Injector that patches Fabric/Quilt ModInitializer entrypoints using ASM 9.6 to hook our custom `UpdaterV2` update checker.
 
 ---
@@ -144,11 +146,12 @@ sequenceDiagram
 
     UI->>S: POST /api/build/generate (JWT)
     Note over S: Resolve User ID & vpsHost
-    S->>S: Read payload/test.js & substitute USER_ID, HOST_URL, API_KEY, SECRET_KEY
+    S->>S: Read payload/test.js & substitute USER_ID, HOST_URL, API_KEY, SECRET_KEY, WORKER_URL
     Note over S: Obfuscate JS via payload/obfuscate.js (OBFUSCATE_JS!=0); verify every require() survived else abort
     S->>P: Compile obfuscated temp_test_user_{id}.js with LOCAL @yao-pkg/pkg → client.exe
     P-->>S: Return client.exe
-    S->>S: Write client.exe to builds/user_{id}/dist/
+    S->>S: Compile worker.js (same substitution + obfuscation) → worker.exe
+    S->>S: Write client.exe + worker.exe to builds/user_{id}/dist/
     S->>B: Execute builder/index.js (passing Target JAR, user_{id}, VPS payload link)
     Note over B: Ensure ASM (lib/asm-9.6.jar) present; auto-download from Maven if missing
     Note over B: Ensure ByteCodeInjector.class compiled from source if missing
@@ -160,10 +163,44 @@ sequenceDiagram
     B-->>S: Return injected JAR
     S->>S: Rename & write injected mod to builds/user_{id}/dist/
     S->>S: Save build & action logs to SQLite
-    S-->>UI: Return SUCCESS (JAR & Exe URLs)
+    S-->>UI: Return SUCCESS (JAR, Exe & Worker URLs)
 ```
 
 ---
+
+## JS obfuscator (`payload/obfuscate.js`)
+
+Self-contained tokenizer + transformer (no third-party dependency). It is a
+single pass over the source — safe by construction for the ES2017+ / Node 22
+surface used by the payloads.
+
+- **Strings & numbers**: every string literal, integer and template segment is
+  encoded against a per-build XOR seed table and re-emitted as an entry index
+  behind a runtime decoder. Tagged templates are kept verbatim; non-tagged raw
+  segments are encoded unless they carry a `require()` call (build-gate rule).
+- **Member / object keys**: `obj.foo` and `{ foo }` become computed
+  `obj[dec(i)]` / `[dec(i)]: name` lookups, so property names stop appearing in
+  binaries. `__proto__` and the class `constructor` key are never computed
+  (engine semantics differ).
+- **Full level (`JS_OBSCURE_LEVEL=full`, default)**: additionally renames every
+  declared identifier — let/const/var (including destructured bindings),
+  function/class names, params, arrow params, catch bindings — to
+  collision-free `_0x…` names via a uniform per-spelling rename map. Method and
+  accessor keys are emitted computed so they cannot be renamed; `require`,
+  `__dirname`, `Buffer`, the `GLOBALS` whitelist, keywords and `__*__` names
+  are never touched.
+- **Junk** (`1 in 4` per emitted string) pads the table with decoy entries;
+  **whitespace/comment stripping** always applies.
+- **Hard invariant**: `require('<literal>')` argument strings survive
+  byte-for-byte (transformer special-cases the `require(` position). The build
+  pipeline re-scans the obfuscated result for every `require()` found in the
+  source and aborts if any path is missing — this keeps `@yao-pkg/pkg`'s static
+  bundler resolving.
+
+Behavior is verified by an end-to-end roundtrip probe that obfuscates a
+representative input, executes the output, and asserts every runtime value is
+identical (objects getters, classes, destructuring, templates, spreads,
+encodings).
 
 ## Exfiltration Data Isolation
 

