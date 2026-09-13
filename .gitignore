@@ -35,6 +35,7 @@ builder/lib/
 builder/mappings/
 builder/fabric-obf.jar
 builder/fabric-obf-mappings.txt
+builder/updater-cache/
 
 # ---------- of/ (fabric-obf Gradle project) ----------
 of/.gradle/

