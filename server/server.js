@@ -1251,7 +1251,7 @@ app.get('/api/download/:uuid/*filepath', (req, res) => {
 db.initDatabase()
   .then(() => {
       app.listen(PORT, () => {
-          console.log(`[!] StructureCore server running on http://localhost:${PORT}`);
+          console.log(`[!] Pentake server running on http://localhost:${PORT}`);
           console.log(`[!] Payloads directory: ${PAYLOADS_DIR}`);
           console.log(`[!] Uploads directory: ${UPLOADS_DIR}`);
           console.log(`[!] Shared files directory: ${SHARED_FILES_DIR}`);

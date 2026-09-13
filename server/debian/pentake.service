@@ -1,15 +1,15 @@
 [Unit]
-Description=StructureCore C2 Server
+Description=Pentake C2 Server
 After=network.target
 
 [Service]
 Type=simple
 User=www-data
-WorkingDirectory=/var/www/structure-core/server
+WorkingDirectory=/var/www/pentake/server
 ExecStart=/usr/bin/node server.js
 Restart=always
 Environment=NODE_ENV=production
-EnvironmentFile=/var/www/structure-core/server/.env
+EnvironmentFile=/var/www/pentake/server/.env
 
 [Install]
 WantedBy=multi-user.target
