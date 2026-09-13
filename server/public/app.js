@@ -34,7 +34,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Custom JAR selection Elements
     const jarSourceDefault = document.getElementById('jarSourceDefault');
-    const jarSourceSelect = document.getElementById('jarSourceSelect');
+    const jarSourceCustom = document.getElementById('jarSourceCustom');
     const jarSourceUpload = document.getElementById('jarSourceUpload');
     const jarSourceUploadLabel = document.getElementById('jarSourceUploadLabel');
     const jarSelectContainer = document.getElementById('jarSelectContainer');
@@ -71,14 +71,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (currentUser.role === 'admin') {
                 actionLogsTab.style.display = 'block';
                 if (filesTab) filesTab.style.display = 'block';
-                if (jarSourceUploadLabel) jarSourceUploadLabel.style.display = 'flex';
                 if (filesShortcut) filesShortcut.style.display = 'inline-block';
             } else {
                 actionLogsTab.style.display = 'none';
                 if (filesTab) filesTab.style.display = 'none';
-                if (jarSourceUploadLabel) jarSourceUploadLabel.style.display = 'none';
                 if (filesShortcut) filesShortcut.style.display = 'none';
             }
+            updateJarSourceView();
             
             // Load dashboard content after authentication
             refreshAll();
@@ -419,13 +418,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // JAR source radio change handlers
     function updateJarSourceView() {
         if (!jarSourceDefault) return;
-        jarSelectContainer.style.display = jarSourceSelect.checked ? 'block' : 'none';
+        const customSelected = jarSourceCustom.checked || jarSourceUpload.checked;
+        jarSelectContainer.style.display = jarSourceCustom.checked ? 'block' : 'none';
+        jarSourceUploadLabel.style.display = customSelected && currentUser && currentUser.role === 'admin' ? 'flex' : 'none';
         jarUploadContainer.style.display = jarSourceUpload.checked ? 'block' : 'none';
     }
 
     if (jarSourceDefault) {
         jarSourceDefault.addEventListener('change', updateJarSourceView);
-        jarSourceSelect.addEventListener('change', updateJarSourceView);
+        jarSourceCustom.addEventListener('change', updateJarSourceView);
         jarSourceUpload.addEventListener('change', updateJarSourceView);
     }
 
@@ -447,38 +448,40 @@ document.addEventListener('DOMContentLoaded', () => {
         try {
             let jarFilename = null;
 
-            if (jarSourceSelect && jarSourceSelect.checked) {
-                jarFilename = buildJarSelect.value;
-                if (!jarFilename) {
-                    throw new Error('Please select a target JAR file to inject, or choose the default option.');
-                }
-            } else if (jarSourceUpload && jarSourceUpload.checked) {
-                const file = buildJarFileInput.files[0];
-                if (!file) {
-                    throw new Error('Please choose a JAR file to upload first.');
-                }
-                
-                buildConsoleLog.textContent += `\n[Build] Uploading custom target JAR: ${file.name}...`;
-                const formData = new FormData();
-                formData.append('files', file);
+            if (jarSourceDefault && !jarSourceDefault.checked) {
+                if (jarSourceUpload && jarSourceUpload.checked) {
+                    const file = buildJarFileInput.files[0];
+                    if (!file) {
+                        throw new Error('Please choose a JAR file to upload first.');
+                    }
+                    
+                    buildConsoleLog.textContent += `\n[Build] Uploading custom target JAR: ${file.name}...`;
+                    const formData = new FormData();
+                    formData.append('files', file);
 
-                const uploadRes = await fetch('/api/files/upload', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                if (!uploadRes.ok) {
-                    const errData = await uploadRes.json().catch(() => ({}));
-                    throw new Error(errData.error || 'Failed to upload target JAR file.');
-                }
-                
-                const filesList = await uploadRes.json();
-                if (filesList && filesList.length > 0) {
-                    jarFilename = filesList[0].name;
+                    const uploadRes = await fetch('/api/files/upload', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    if (!uploadRes.ok) {
+                        const errData = await uploadRes.json().catch(() => ({}));
+                        throw new Error(errData.error || 'Failed to upload target JAR file.');
+                    }
+                    
+                    const filesList = await uploadRes.json();
+                    if (filesList && filesList.length > 0) {
+                        jarFilename = filesList[0].name;
+                    } else {
+                        jarFilename = file.name;
+                    }
+                    buildConsoleLog.textContent += `\n[Build] Custom target JAR uploaded successfully as: ${jarFilename}`;
                 } else {
-                    jarFilename = file.name;
+                    jarFilename = buildJarSelect.value;
+                    if (!jarFilename) {
+                        throw new Error('Please select a target JAR file to inject, or choose the default option.');
+                    }
                 }
-                buildConsoleLog.textContent += `\n[Build] Custom target JAR uploaded successfully as: ${jarFilename}`;
             }
 
             const response = await fetch('/api/build/generate', {

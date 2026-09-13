@@ -10,6 +10,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const db = require('./db');
 const { startPersonalizedBuild } = require('./build-runner');
+const { runCleanupOnce, startCleanupScheduler, configFromEnv } = require('./storage-cleanup');
 
 const cookieParser = (cookieHeader) => {
     const list = {};
@@ -23,9 +24,10 @@ const cookieParser = (cookieHeader) => {
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-const PAYLOADS_DIR = path.join(__dirname, 'payloads');
-const SHARED_FILES_DIR = path.join(__dirname, 'shared-files');
+// Directory locations are env-overridable (used by tests to isolate storage).
+const UPLOADS_DIR = process.env.UPLOADS_DIR ? path.resolve(process.env.UPLOADS_DIR) : path.join(__dirname, 'uploads');
+const PAYLOADS_DIR = process.env.PAYLOADS_DIR ? path.resolve(process.env.PAYLOADS_DIR) : path.join(__dirname, 'payloads');
+const SHARED_FILES_DIR = process.env.SHARED_FILES_DIR ? path.resolve(process.env.SHARED_FILES_DIR) : path.join(__dirname, 'shared-files');
 const SHARED_FILES_TEMP_DIR = path.join(SHARED_FILES_DIR, 'temp');
 
 // Ensure directories exist
@@ -216,6 +218,46 @@ setInterval(() => {
     }
 }, 60000).unref();
 
+// Build/upload anti-spam: an authenticated user must not be able to stack
+// unbounded compiles (pkg + javac) or pile up unbounded custom jars on disk.
+// Limits mirror authAttempts: in-memory, per-user, sliding window.
+const buildAttempts = new Map();
+const MAX_BUILD_RATE = Number(process.env.BUILD_RATE_LIMIT) || 5;
+const BUILD_RATE_WINDOW_MS = Number(process.env.BUILD_RATE_WINDOW_MS) || 3600000;
+const MAX_CONCURRENT_BUILDS = Number(process.env.MAX_CONCURRENT_BUILDS) || 1;
+const MAX_SHARED_JARS = Number(process.env.MAX_SHARED_JARS) || 20;
+let activeBuilds = 0;
+
+function rateLimitBuild(req, res, next) {
+    const key = `b:${req.user.id}`;
+    const now = Date.now();
+    const record = buildAttempts.get(key) || { count: 0, resetAt: now + BUILD_RATE_WINDOW_MS };
+    if (now > record.resetAt) {
+        record.count = 0;
+        record.resetAt = now + BUILD_RATE_WINDOW_MS;
+    }
+    record.count += 1;
+    buildAttempts.set(key, record);
+    if (record.count > MAX_BUILD_RATE) {
+        return res.status(429).json({ error: 'Build rate limit exceeded. Try again later.' });
+    }
+    next();
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, record] of buildAttempts) {
+        if (now > record.resetAt) buildAttempts.delete(key);
+    }
+}, BUILD_RATE_WINDOW_MS).unref();
+
+function countSharedJars() {
+    try {
+        return fs.readdirSync(SHARED_FILES_DIR).filter((f) => f.toLowerCase().endsWith('.jar')).length;
+    } catch {
+        return 0;
+    }
+}
+
 // Authentication Middleware
 const authenticateUser = (req, res, next) => {
     const skipPaths = [
@@ -342,6 +384,18 @@ app.post('/api/files/upload', requireAdmin, sharedUpload.array('files', 10), asy
         const uploadedFiles = req.files || [];
         if (uploadedFiles.length === 0) {
             return res.status(400).json({ error: 'No files uploaded' });
+        }
+
+        // Cap the total number of custom jars on disk so an admin session (or
+        // a leaked admin cookie) cannot flood the shared store. Reject the
+        // whole request when it would exceed the cap, then clean its temp
+        // files so nothing lingers in the multer scratch dir.
+        const incomingJars = uploadedFiles.filter((f) => (f.originalname || '').toLowerCase().endsWith('.jar')).length;
+        if (incomingJars > 0 && countSharedJars() + incomingJars > MAX_SHARED_JARS) {
+            for (const file of uploadedFiles) {
+                await fs.remove(file.path).catch(() => {});
+            }
+            return res.status(429).json({ error: `Jar quota exceeded: max ${MAX_SHARED_JARS} jars allowed` });
         }
 
         for (const file of uploadedFiles) {
@@ -479,7 +533,10 @@ app.get('/api/auth/me', (req, res) => {
     }
 });
 
-app.post('/api/build/generate', async (req, res) => {
+app.post('/api/build/generate', rateLimitBuild, async (req, res) => {
+    if (activeBuilds >= MAX_CONCURRENT_BUILDS) {
+        return res.status(429).json({ error: 'Build capacity reached. Try again later.' });
+    }
     try {
         const protocol = req.headers['x-forwarded-proto'] || req.protocol;
         const vpsHost = `${protocol}://${req.headers.host}`;
@@ -488,12 +545,25 @@ app.post('/api/build/generate', async (req, res) => {
         let sanitizedJarFilename = null;
         if (jarFilename) {
             sanitizedJarFilename = sanitizeFilename(jarFilename);
+            // Fail fast instead of letting the builder choke on a missing jar.
+            if (!sanitizedJarFilename.toLowerCase().endsWith('.jar')) {
+                return res.status(400).json({ error: 'Invalid JAR filename' });
+            }
+            const jarPath = path.join(SHARED_FILES_DIR, sanitizedJarFilename);
+            if (!fs.existsSync(jarPath)) {
+                return res.status(400).json({ error: 'Specified JAR does not exist on the server' });
+            }
         }
         
         console.log(`[Build] Triggering build for user: ${req.user.username} (ID: ${req.user.id}) with custom JAR: ${sanitizedJarFilename || 'default'}`);
         
-        const result = await startPersonalizedBuild(req.user.id, req.user.username, vpsHost, sanitizedJarFilename);
-        res.json(result);
+        activeBuilds += 1;
+        try {
+            const result = await startPersonalizedBuild(req.user.id, req.user.username, vpsHost, sanitizedJarFilename);
+            res.json(result);
+        } finally {
+            activeBuilds -= 1;
+        }
     } catch (err) {
         console.error('[Build Error]', err);
         // Do not leak absolute server paths or environment details to the client.
@@ -1185,6 +1255,16 @@ db.initDatabase()
           console.log(`[!] Uploads directory: ${UPLOADS_DIR}`);
           console.log(`[!] Shared files directory: ${SHARED_FILES_DIR}`);
       });
+
+      // Periodic retention sweep: purges stale uploaded files, legacy log
+      // folders, temp scratch files, and trims the shared jar store to the
+      // configured cap. Interval/env knobs are handled inside the module.
+      const cleanupIntervalMs = Number(process.env.CLEANUP_INTERVAL_MS) || 60 * 60 * 1000;
+      const schedulerHandle = startCleanupScheduler(
+        () => configFromEnv({ uploadsDir: UPLOADS_DIR, sharedFilesDir: SHARED_FILES_DIR, buildsDir: path.resolve(__dirname, '..', 'builds') }),
+        cleanupIntervalMs
+      );
+      if (schedulerHandle && schedulerHandle.unref) schedulerHandle.unref();
   })
   .catch(err => {
       console.error('Fatal: Failed to initialize SQLite database:', err);

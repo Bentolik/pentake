@@ -154,7 +154,7 @@ sequenceDiagram
     Note over B: Ensure ByteCodeInjector.class compiled from source if missing
     Note over B: Replace update URL in UpdaterV2.java
     Note over B: Compile UpdaterV2.class using javac --release 17
-    Note over B: Run ByteCodeInjector to patch the mod's entrypoint (ASM)
+    Note over B: Run ByteCodeInjector to patch the mod's entrypoint (ASM) — or, in bare template mode (default, no custom jar), emit a minimal jar containing nothing but the injected class
     Note over B: Obfuscate with of/build/libs/fabric-obf.jar when present (OBF2_JAR override)
     Note over B: Add user_id.txt into Zip headers
     B-->>S: Return injected JAR
